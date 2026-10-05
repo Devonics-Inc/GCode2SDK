@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fairino-gcode"
+dynamic = ["version"]
+description = "Preview a G-code toolpath, place it on a FAIRINO cobot and run it."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "matplotlib>=3.5",
+    "PySide6>=6.4",
+]
+# The FAIRINO Python SDK (the "fairino" package) is needed to command a real robot. It is not on PyPI:
+# install it from the SDK download, or let packaging/build_app.py bundle it into the application.
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff", "pyinstaller>=6"]
+
+[project.gui-scripts]
+fairino-gcode = "fairino_gcode.gcode_gui:main"
+
+[project.scripts]
+fairino-gcode-cli = "fairino_gcode.gcode_to_fairino:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "fairino_gcode.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+fairino_gcode = ["samples/*.gcode", "resources/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+extend-exclude = ["src/fairino_gcode/fairino_CNDE_listener.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B"]
+ignore = ["B008", "B905", "B023"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/fairino_gcode/gcode_gui.py" = ["E402"]     # Qt binding and matplotlib backend are chosen before the imports
+"src/fairino_gcode/gcode_to_fairino.py" = ["F401", "W292"]
