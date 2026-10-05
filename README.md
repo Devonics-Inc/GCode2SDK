@@ -9,7 +9,7 @@ Featuring:
 * placement by teach point, at the tool, automatic, or typed; reachability check of the whole path
 * Start / Stop, with every command logged
 
-<video src="./docs/GCode2SDK.mp4" width="100%" controls></video>
+![GCode2SDK Demo](docs/GCode2SDK.gif)
 
 # Disclaimer
 GCode2SDK is provided as open-source software for experimentation, development, and educational purposes. It is provided "as is" and without warranty of any kind. The tool is not an official replacement for the robot manufacturer's software or webapp and has not been guaranteed for production or safety-critical applications.
