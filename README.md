@@ -1,11 +1,18 @@
-# FAIRINO G-code Runner
+# GCode2SDK
 
-Preview a G-code toolpath, place it on a FAIRINO cobot and run it - without generating a LUA file.
+GCode2SDK is a tool that parses G-code and translates its motion commands into robot SDK bypassing webapp completely
+
+Featuring:
 
 * 3D preview of the plan, command by command (G0 -> MoveJ, G1 -> MoveL, G2/G3 -> MoveC / Circle)
 * live robot TCP in the same view
 * placement by teach point, at the tool, automatic, or typed; reachability check of the whole path
 * Start / Stop, with every command logged
+
+# Disclaimer
+GCode2SDK is provided as open-source software for experimentation, development, and educational purposes. It is provided "as is" and without warranty of any kind. The tool is not an official replacement for the robot manufacturer's software or webapp and has not been guaranteed for production or safety-critical applications.
+
+Users are responsible for validating generated motion commands, robot reachability, tool configuration, coordinate systems, speeds, and the overall safety of the robot and its environment before execution. Use this software at your own risk.
 
 ## For users: the standalone application
 
