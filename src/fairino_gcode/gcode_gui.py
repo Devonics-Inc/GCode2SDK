@@ -333,7 +333,7 @@ class PlanCanvas(FigureCanvasQTAgg):
 # ============================================================================ command list
 class CommandTable(QtCore.QAbstractTableModel):
     """One row per command of the plan: what the G-code said and what the robot will be told."""
-    HEAD = ["#", "Line", "G-code", "Robot command", "X", "Y", "Z", "mm/s"]
+    HEAD = ["#", "Line", "G-code", "Robot command", "mm/s"]
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -369,8 +369,6 @@ class CommandTable(QtCore.QAbstractTableModel):
                 return c.src
             if col == 3:
                 return c.instr if motion else self.describe(index.row()).split(" -> ", 1)[1]
-            if motion and col in (4, 5, 6):
-                return f"{c.poses[-1][col - 4] + 0.0:.3f}"
             if motion and col == 7:
                 return f"{eng.speed_mm_s(c, self._plan.settings):.1f}"
             return None
@@ -461,6 +459,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.detail.setMargin(4)
 
         self.robot_panel = RobotStatusPanel()
+        self.robot_panel.setFixedHeight(200)
 
         right = QtWidgets.QSplitter(Qt.Orientation.Vertical)
         right.addWidget(self.robot_panel)
@@ -472,7 +471,7 @@ class MainWindow(QtWidgets.QMainWindow):
         box.addWidget(self.detail)
         right.addWidget(lower)
         right.setStretchFactor(2, 1)
-        right.setSizes([150, 160, 450])
+        right.setSizes([220, 160, 380])
 
         split = QtWidgets.QSplitter(Qt.Orientation.Horizontal)
         split.addWidget(self.canvas)
@@ -767,7 +766,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.table_model.set_plan(plan)
         self.table.resizeColumnsToContents()
         for col in (2, 3):                         # long G-code lines must not push the numbers out of sight
-            self.table.setColumnWidth(col, min(self.table.columnWidth(col), 150))
+            self.table.setColumnWidth(col, min(self.table.columnWidth(col), 260))
         self.canvas.show_plan(plan)
         text = list(plan.summary)
         if plan.warnings:

@@ -53,8 +53,11 @@ Either start the tools from the SDK's `linux/` (or `windows/`) folder, or add th
 
 ### Building the standalone application
 
-    python packaging/build_app.py --sdk /path/to/fairino-python-sdk/linux
-
+    cd ~/github/GCode2SDK
+    source .venv/bin/activate
+    python packaging/build_app.py --sdk ~/github/fairino-sdks/fairino-python-sdk-2.2.5_robot_v3.9.5/linux
+    sh dist/fairino-gcode/install.sh
+    
 Builds `dist/fairino-gcode/`, runs its self-test, and packs it. Build on each operating system you
 ship for. On Windows, `packaging/windows/installer.iss` (Inno Setup) turns the folder into a Setup.exe.
 
