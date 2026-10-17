@@ -32,6 +32,7 @@ Examples:
     python gcode_to_fairino.py part.gcode --ref-point refPose --check-ik --dry-run
     python gcode_to_fairino.py part.gcode --ref-point refPose
     python gcode_to_fairino.py part.nc --origin-here --tool 1 --spindle-do 0
+    python gcode_to_fairino.py part.gcode --ref-point refPose --check-ik --export part_fairino.py
 """
 import argparse
 import math
@@ -908,6 +909,11 @@ def build_parser():
     p.add_argument("--check-jump", type=float, default=60.0, help=argparse.SUPPRESS)   # deg, see check_ik()
     p.add_argument("--check-max", type=int, default=400, help=argparse.SUPPRESS)       # give up after this many
     p.add_argument("--preview", action="store_true", help="3D plot of the toolpath (matplotlib)")
+    p.add_argument("--export", metavar="FILE.py",
+                   help="write the job as a stand-alone Python script for the FAIRINO SDK instead of running it "
+                        "(add --check-ik to check reachability with the robot first)")
+    p.add_argument("--export-style", choices=["simple", "checked"], default="simple",
+                   help="simple: a flat list of SDK calls; checked: with the app's checks before and during the run")
     p.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
     return p
 
@@ -925,7 +931,7 @@ def main():
     if len(warnings) > 15:
         print(f"... and {len(warnings) - 15} more warnings")
 
-    needs_robot = bool(a.ref_point) or a.origin_here or a.check_ik or not a.dry_run
+    needs_robot = bool(a.ref_point) or a.origin_here or a.check_ik or not (a.dry_run or a.export)
     try:
         robot = connect(a.ip) if needs_robot else None
         frame = resolve_frame(a, robot)
@@ -949,6 +955,18 @@ def main():
     try:
         if a.check_ik and not streamer.check_ik(cmds):
             sys.exit("Fix reachability (origin/scale/orientation) before running.")
+        if a.export:
+            try:
+                from . import export_script
+            except ImportError:                  # run as a plain script, export_script.py next to it
+                import export_script
+            summary = []
+            summarize(cmds, frame, a, follow, out=summary.append)
+            export_script.export_cmds(cmds, a, a.file, a.export, summary, a.ip, checked=a.check_ik,
+                                      style=a.export_style)
+            print(f"Exported to {a.export} ({a.export_style} script)" + ("" if a.check_ik else
+                  "  - not checked with the robot: add --check-ik to check every point first"))
+            return
         if a.dry_run:
             return
         if not a.yes and input(f"Robot will MOVE (global speed will be set to {a.global_speed} %). "

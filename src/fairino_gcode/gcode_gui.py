@@ -24,6 +24,10 @@ Step 3 - run the plan on the robot:
     * Stop ends the run and stops the arm within milliseconds
     * --simulate runs all of this against a simulated robot (sim_robot.py) instead of a real one
 
+Step 4 - export:
+    * Export Python... saves the checked plan as a stand-alone script that runs it through the FAIRINO
+      SDK (export_script.py): the same commands Start would send, without this application
+
 The plan is built by the same code the command-line tool runs (parse_gcode -> plan), so what is
 drawn here is what would be sent to the robot.
 
@@ -62,8 +66,9 @@ from mpl_toolkits.mplot3d.art3d import Line3DCollection  # noqa: E402
 
 from . import APP_NAME, __version__  # noqa: E402
 from . import gcode_to_fairino as eng  # noqa: E402
+from .export_script import default_name, export_plan  # noqa: E402
 from .plan_model import Plan, build_plan, default_settings  # noqa: E402
-from .robot_monitor import TCP, RobotMonitor, Target  # noqa: E402
+from .robot_monitor import DEFAULT_IP, TCP, RobotMonitor, Target  # noqa: E402
 from .robot_widgets import ConnectDialog, RobotStatusPanel  # noqa: E402
 from .run_control import AUTO, HERE, MANUAL, Job, JobResult, RobotSession, RunSetup, RunSetupDialog  # noqa: E402
 
@@ -502,6 +507,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_continue.setVisible(False)
         for act in (self.act_start, self.act_stop):
             bar.widgetForAction(act).setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.act_export = bar.addAction("Export Python…", self.export_python)
+        self.act_export.setToolTip("Save the checked plan as a Python script that runs it with the FAIRINO SDK, "
+                                   "without this application")
         bar.addSeparator()
         bar.addWidget(QtWidgets.QLabel(" View: "))
         for name in VIEWS:
@@ -528,6 +536,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_setup.setEnabled(connected and not busy and self.plan is not None)
         self.act_start.setEnabled(connected and not busy and self.checked is not None)
         self.act_stop.setEnabled(running)
+        self.act_export.setEnabled(not busy and self.checked is not None)    # only a placed, checked plan
         if not running:
             self.act_continue.setVisible(False)
 
@@ -647,6 +656,33 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.job is not None:
             self.job.proceed()
             self._say("busy", "Running - press Stop to stop the robot.")
+
+    def export_python(self):
+        """Save the checked plan as a stand-alone Python script for the FAIRINO SDK."""
+        if self.checked is None or self.job is not None:
+            return
+        simple, checked = "Simple script - plain SDK calls (*.py)", "Script with safety checks (*.py)"
+        path, chosen = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export as Python script", default_name(self.checked.path), f"{simple};;{checked}")
+        if not path:
+            return
+        style = "checked" if chosen == checked else "simple"
+        if not path.lower().endswith(".py"):
+            path += ".py"
+        if self.simulator is not None:
+            ip = DEFAULT_IP
+            note = ("WARNING: exported from --simulate mode. The coordinates were placed on the SIMULATED\n"
+                    "robot and mean nothing on a real one: export again while connected to the real robot.")
+        else:
+            ip, note = self.session.ip, ""
+        try:
+            export_plan(self.checked, path, ip=ip, checked=True, note=note, style=style)
+        except (OSError, ValueError, SyntaxError) as e:
+            QtWidgets.QMessageBox.critical(self, "Export failed", str(e))
+            return
+        self.log.appendPlainText(f"Exported {os.path.basename(self.checked.path)} as {path}")
+        self._say("good", f"Exported as {os.path.basename(path)} ({style} script). "
+                          f"Run it with: python {os.path.basename(path)}  (it asks before moving)")
 
     def _launch(self, job: Job):
         self.job = job
