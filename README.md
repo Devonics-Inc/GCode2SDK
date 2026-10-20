@@ -28,11 +28,37 @@ Try it without a robot: start it as `fairino-gcode --simulate`. Check an install
 
 ## For developers
 
-    pip install -e ".[dev]"        # from this folder; Python 3.9 or newer
-    fairino-gcode                  # the application
-    fairino-gcode --simulate       # with a simulated robot
-    fairino-gcode-cli part.gcode --dry-run      # the command-line tool
-    python -m pytest               # the tests (all against the simulated robot)
+
+    # 1. Check Python is installed (3.9 or newer)
+    py --version
+
+    # make sure the widnows pythonSDK with proper version is stored under src/fairino 
+
+    # 2. Go to the repo
+    cd path\to\GCode2SDK
+
+    # 3. Create a virtual environment
+    py -m venv .venv
+
+    # 4. Activate it
+    #    If you get "running scripts is disabled", run this once, then retry:
+    #    Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+    .\.venv\Scripts\Activate.ps1
+
+    # 5. Install the project and dev tools
+    python -m pip install -e ".[dev]"
+
+    # 6. Run it
+    fairino-gcode              # the application
+    fairino-gcode --simulate   # simulation mode, no robot needed
+
+
+    # 7. Make a relase 
+    python packaging/build_app.py --no-sdk 
+
+    # or you can path the SDK path
+    python packaging/build_app.py --sdk ~/github/fairino-sdks/fairino-python-sdk-2.2.5_robot_v3.9.5/linux
+
 
 Commanding a real robot needs the FAIRINO Python SDK (the `fairino` package), which is not on PyPI.
 Either start the tools from the SDK's `linux/` (or `windows/`) folder, or add that folder to `PYTHONPATH`.
