@@ -22,6 +22,8 @@ from types import SimpleNamespace
 JOINT_MAX_SPEED = 180.0          # deg/s, what 100 % means for MoveJ
 ERR_NO_IK = 112                  # error codes are arbitrary non-zero values
 ERR_BAD_ARC = 101
+ERR_ARC_POINTS_TOO_CLOSE = 185   # what a real FR controller answered for a MoveC with points < 1.0 mm apart
+MIN_ARC_POINT_GAP = 1.0          # mm (measured 2026-10: the same at every radius and sweep)
 ERR_STOPPED = 3
 
 
@@ -192,6 +194,10 @@ class SimRobot:
         start, via, end = list(self._planned_end), list(map(float, desc_pos_p)), list(map(float, desc_pos_t))
         kwargs = dict(desc_pos_p=via, desc_pos_t=end, tool=tool, user=user, vel=vel, ovl=ovl, blendR=blendR,
                       oacc=oacc, velAccParamMode=mode)
+        if min(math.dist(start[:3], via[:3]), math.dist(via[:3], end[:3])) < MIN_ARC_POINT_GAP:
+            with self._cv:
+                self.calls.append((name, kwargs))
+            return ERR_ARC_POINTS_TOO_CLOSE
         circle = _circle_through(start[:3], via[:3], end[:3])
         if circle is None:
             with self._cv:
