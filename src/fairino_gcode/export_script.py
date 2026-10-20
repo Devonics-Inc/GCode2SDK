@@ -66,6 +66,10 @@ def program_lines(cmds, a):
     for idx, c in enumerate(cmds):
         nxt = cmds[idx + 1] if idx + 1 < len(cmds) else None
         blend = "BLEND" if feed_move(c) and feed_move(nxt) else "EXACT"
+        if blend == "BLEND":                    # same cap as Streamer.run(): the blend must fit short moves
+            fit = eng.blend_limit(c, nxt, float(getattr(a, "scale", 1.0)))
+            if fit < a.blend:
+                blend = f"min(BLEND, {num(round(fit, 3))})"
         where = f"{c.line}, {c.src!r}"
         if c.kind == "line":
             if c.instr == "MoveJ":

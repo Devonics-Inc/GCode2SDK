@@ -10,6 +10,8 @@ Supported G-code:
     G1               linear move         -> MoveL
     G2 / G3          XY arc (I/J or R)   -> MoveC
     G2 / G3          full XY circle      -> Circle
+                     (an arc whose MoveC points would be closer than --min-arc-gap mm, which the
+                     controller refuses, is sent as short MoveL segments instead)
     G4 P/S           dwell
     G17 G20 G21 G90 G91
     M3/M4/M5         spindle/laser/pen on/off -> control-box DO (--spindle-do)
@@ -271,6 +273,62 @@ def polyline(c, step_deg=5.0):
              z0 + (z1 - z0) * k / n) for k in range(n + 1)]
 
 
+MIN_ARC_GAP = 1.05     # mm. The controller refuses a MoveC / Circle when two of its points are closer than
+                       # 1.0 mm, whatever the radius (measured on an FR controller, 2026-10: error 185).
+ARC_TOL = 0.05         # mm, how far the MoveL segments that replace such an arc may stray from it
+
+
+def arc_gap(c, scale=1.0):
+    """Smallest distance (robot mm) between the points of a MoveC / Circle: start -> path point -> target."""
+    return min(math.dist(c.start, c.mid), math.dist(c.mid, c.end)) * scale
+
+
+def arc_to_lines(c, tol):
+    """The arc / circle c as straight "line" commands that stay within tol (G-code units) of the curve."""
+    cx, cy, radius, a0, sweep = c.arc
+    step = 2 * math.acos(max(-1.0, 1.0 - tol / radius))   # angle per segment for a chord error of tol
+    n = max(1, math.ceil(abs(sweep) / step - 1e-9))
+    z0 = c.start[2]
+    z1 = z0 if c.kind == "circle" else c.end[2]
+    pts = [(cx + radius * math.cos(a0 + sweep * k / n), cy + radius * math.sin(a0 + sweep * k / n),
+            z0 + (z1 - z0) * k / n) for k in range(1, n + 1)]
+    pts[-1] = c.start if c.kind == "circle" else c.end    # end exactly where the arc ends
+    out, prev = [], c.start
+    for p in pts:
+        out.append(Cmd("line", c.line, start=prev, end=p, feed=c.feed, spindle=c.spindle, src=c.src))
+        prev = p
+    return out
+
+
+def limit_arcs(cmds, scale=1.0, min_gap=MIN_ARC_GAP, tol=ARC_TOL):
+    """Replace every MoveC / Circle the controller would refuse (two of its points closer than min_gap mm)
+    by MoveL segments within tol mm of the arc. scale: G-code units -> robot mm. min_gap <= 0: keep all.
+    Returns (commands, notes) - one note per replaced arc."""
+    out, notes = [], []
+    for c in cmds:
+        if c.kind in ("arc", "circle") and min_gap > 0 and arc_gap(c, scale) < min_gap:
+            lines = arc_to_lines(c, tol / scale)
+            notes.append(f"line {c.line}: {c.src} - its {'Circle' if c.kind == 'circle' else 'MoveC'} points "
+                         f"would be {arc_gap(c, scale):.2f} mm apart (minimum {min_gap:g}): "
+                         f"sent as {len(lines)} MoveL instead")
+            out += lines
+        else:
+            out.append(c)
+    return out, notes
+
+
+def motion_length(c, scale=1.0):
+    """Path length of a motion in robot mm."""
+    seq = polyline(c)
+    return sum(math.dist(p, q) for p, q in zip(seq, seq[1:])) * scale
+
+
+def blend_limit(c, nxt, scale=1.0):
+    """Largest blend radius (mm) that fits between motion c and the next one: the blend has to start and
+    end on the two moves, so it stays below half the shorter of them."""
+    return 0.45 * min(motion_length(c, scale), motion_length(nxt, scale))
+
+
 def headings(c):
     """Direction of travel in the XY plane (rad) at the start of a motion and at each of its targets.
     None = no XY direction (pure Z move)."""
@@ -414,7 +472,8 @@ ERROR_TEXT = {
     171: "a joint is beyond its soft limit", 172: "the speed cannot be 0",
     ERR_SPEED_LIMIT: "the speed is above the controller's limit - lower --global-speed",
     ERR_ACC_LIMIT: "the acceleration is above the controller's limit - lower --global-speed",
-    185: "a fault signal stopped the motion", 186: "the emergency stop stopped the motion",
+    185: "a fault signal stopped the motion (a MoveC / Circle with points under 1.0 mm apart gets this too)",
+    186: "the emergency stop stopped the motion",
     204: "the controller's command queue is full",
 }
 
@@ -784,7 +843,10 @@ class Streamer:
         t0 = time.time()
         for idx, c in enumerate(cmds):
             nxt = cmds[idx + 1] if idx + 1 < len(cmds) else None
-            self.send(c, self.a.blend if feed_move(c) and feed_move(nxt) else -1.0)
+            blend = -1.0
+            if feed_move(c) and feed_move(nxt):
+                blend = min(self.a.blend, blend_limit(c, nxt, self.frame.scale))
+            self.send(c, blend)
 
         self.wait_idle()
         if self.spindle_on:
@@ -857,6 +919,11 @@ def build_parser():
     p.add_argument("--arc-split", type=float, default=360.0, metavar="DEG",
                    help="split arcs into MoveC pieces of at most DEG (360 = one MoveC per arc and "
                         "Circle for full circles, like the WebApp)")
+    p.add_argument("--min-arc-gap", type=float, default=MIN_ARC_GAP, metavar="MM",
+                   help="an arc whose MoveC / Circle points would be closer than MM is sent as MoveL segments "
+                        "(the controller refuses points under 1.0 mm apart; 0 = never)")
+    p.add_argument("--arc-tol", type=float, default=ARC_TOL, metavar="MM",
+                   help="max distance between those MoveL segments and the real arc")
     p.add_argument("--global-speed", type=int, default=20,
                    help="speed of every move, %% of the robot's full speed (F / S in the file are ignored)")
     p.add_argument("--max-speed", type=float, default=250.0,
@@ -906,6 +973,9 @@ def main():
     except SetupError as e:
         sys.exit(str(e))
 
+    cmds, notes = limit_arcs(cmds, frame.scale, a.min_arc_gap, a.arc_tol)
+    for note in notes:
+        print("note:", note)
     follow = plan(cmds, frame, a)
     bbox = summarize(cmds, frame, a, follow)
     if bbox is None:

@@ -5,6 +5,8 @@ GCode2SDK is a tool that parses G-code and translates its motion commands into r
 Featuring:
 
 * 3D preview of the plan, command by command (G0 -> MoveJ, G1 -> MoveL, G2/G3 -> MoveC / Circle)
+* arcs the controller refuses (MoveC / Circle points closer than 1.0 mm, error 185) are sent as short MoveL
+  segments instead, with a note in the log (`--min-arc-gap`, `--arc-tol`)
 * live robot TCP in the same view
 * placement by teach point, at the tool, automatic, or typed; reachability check of the whole path
 * Start / Stop, with every command logged

@@ -53,6 +53,10 @@ def build_plan(path: str, settings: argparse.Namespace, frame: Optional[eng.Fram
     placed = frame is not None
     if frame is None:
         frame = eng.Frame(settings.origin, settings.rpy, settings.yaw, settings.scale)
+    # arcs the controller would refuse become MoveL segments (settings saved by older versions lack the keys)
+    cmds, notes = eng.limit_arcs(cmds, frame.scale, getattr(settings, "min_arc_gap", eng.MIN_ARC_GAP),
+                                 getattr(settings, "arc_tol", eng.ARC_TOL))
+    warnings += notes
     follow = eng.plan(cmds, frame, settings)
     summary: List[str] = []
     bbox = eng.summarize(cmds, frame, settings, follow, out=summary.append)
