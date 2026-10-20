@@ -570,7 +570,9 @@ class Streamer:
     def speed(self, c):
         mm_s = speed_mm_s(c, self.a)
         if self.a.speed_mode == "physical":   # ovl = mm/s, oacc = mm/s^2
-            return dict(vel=100.0, ovl=mm_s, oacc=self.a.acc, velAccParamMode=1)
+            # SetSpeed() does not scale physical mm/s, so apply the global % here (as MoveJ gets it)
+            g = self.a.global_speed / 100.0
+            return dict(vel=100.0, ovl=max(0.1, mm_s * g), oacc=self.a.acc, velAccParamMode=1)
         pct = max(1.0, min(100.0, 100.0 * mm_s / self.a.max_speed))
         return dict(vel=pct, ovl=100.0, oacc=100.0, velAccParamMode=0)
 

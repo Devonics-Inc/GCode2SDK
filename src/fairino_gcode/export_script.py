@@ -273,7 +273,8 @@ class Job:
 
     def speed(self, mm_s):
         if SPEED_MODE == "physical":
-            return dict(vel=100.0, ovl=mm_s, oacc=self.acc, velAccParamMode=1)
+            # SetSpeed() does not scale physical mm/s, so apply the global % here (as MoveJ gets it)
+            return dict(vel=100.0, ovl=max(0.1, mm_s * GLOBAL_SPEED / 100.0), oacc=self.acc, velAccParamMode=1)
         return dict(vel=max(1.0, min(100.0, 100.0 * mm_s / MAX_SPEED)), ovl=100.0, oacc=100.0, velAccParamMode=0)
 
     def cartesian(self, mm_s, send):
@@ -488,8 +489,8 @@ def build_simple_script(cmds, a, source: str, summary=(), ip: str = "192.168.58.
 
     def speed(c):
         mm_s = eng.speed_mm_s(c, a)
-        if physical:
-            return f"vel=100, ovl={short(mm_s)}, oacc=ACC"
+        if physical:   # SetSpeed() does not scale physical mm/s, so the global % is applied here
+            return f"vel=100, ovl={short(max(0.1, mm_s * a.global_speed / 100.0))}, oacc=ACC"
         return f"vel={short(max(1.0, min(100.0, 100.0 * mm_s / a.max_speed)))}"
 
     def mode():

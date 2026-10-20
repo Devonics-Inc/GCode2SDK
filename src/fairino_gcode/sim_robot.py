@@ -162,8 +162,9 @@ class SimRobot:
         return 0
 
     def _tcp_speed(self, vel, ovl, mode):
-        v = ovl if mode == 1 else self.max_tcp_speed * vel / 100.0 * ovl / 100.0
-        return v * self.global_speed / 100.0
+        if mode == 1:                       # physical mm/s: the controller's global % does not apply
+            return ovl
+        return self.max_tcp_speed * vel / 100.0 * ovl / 100.0 * self.global_speed / 100.0
 
     def _reachable(self, pose):
         return math.sqrt(sum(v * v for v in pose[:3])) <= self.reach
