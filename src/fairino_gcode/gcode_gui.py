@@ -338,7 +338,7 @@ class PlanCanvas(FigureCanvasQTAgg):
 # ============================================================================ command list
 class CommandTable(QtCore.QAbstractTableModel):
     """One row per command of the plan: what the G-code said and what the robot will be told."""
-    HEAD = ["#", "Line", "G-code", "Robot command", "mm/s"]
+    HEAD = ["#", "Line", "G-code", "Robot command", "Speed"]
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -375,7 +375,7 @@ class CommandTable(QtCore.QAbstractTableModel):
             if col == 3:
                 return c.instr if motion else self.describe(index.row()).split(" -> ", 1)[1]
             if motion and col == 7:
-                return f"{eng.speed_mm_s(c, self._plan.settings):.1f}"
+                return f"{self._plan.settings.global_speed} %"
             return None
         if role == Qt.ItemDataRole.TextAlignmentRole and col not in (2, 3):
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -639,7 +639,7 @@ class MainWindow(QtWidgets.QMainWindow):
             f"{os.path.basename(self.checked.path)}: {len(self.checked.motions)} moves on "
             f"{'the SIMULATED robot' if self.simulator is not None else self.session.ip}\n"
             f"Tool {self.checked.settings.tool}, workpiece {self.checked.settings.user}, "
-            f"global speed {self.checked.settings.global_speed} %\n\n"
+            f"speed {self.checked.settings.global_speed} % for every move\n\n"
             "Make sure the work area is clear and the emergency stop is within reach.")
         start = box.addButton("Start", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
         box.setDefaultButton(box.addButton(QtWidgets.QMessageBox.StandardButton.Cancel))

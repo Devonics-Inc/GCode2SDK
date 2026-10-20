@@ -4,8 +4,8 @@ export_script.py - write a plan out as a stand-alone Python script that runs it 
 
 The exported script is the job frozen: every robot command of the plan, one line per G-code command,
 at the coordinates the plan was placed at, plus the small runtime the engine uses to send them (IK
-referenced to the previous target, blending, motion-queue throttling, waiting for the arm, the
-acceleration retry, Ctrl-C stops the arm). It needs Python 3 and the FAIRINO SDK - not this application.
+referenced to the previous target, blending, motion-queue throttling, waiting for the arm, Ctrl-C
+stops the arm). Every move runs at the one global speed % of the job; F and S in the G-code are ignored. It needs Python 3 and the FAIRINO SDK - not this application.
 
 Before it moves, the script checks that the controller has the job's tool / workpiece frame active
 and that it finds a joint position for every target. The finer check along the path (a point every
@@ -51,12 +51,10 @@ def program_lines(cmds, a):
     def hop(pose, line, label):                 # rapid move `lift` mm above a pose (approach / retract)
         nonlocal n_steps, n_targets
         up = pose[:2] + [round(pose[2] + lift, 4)] + pose[3:]
-        c = eng.Cmd("line", line, rapid=True, spindle=first.spindle)
-        speed = num(eng.speed_mm_s(c, a))
         if a.g0 == "movej":
-            out.append(f"job.movej({vec(up)}, {speed}, {line}, {label!r})")
+            out.append(f"job.movej({vec(up)}, {line}, {label!r})")
         else:
-            out.append(f"job.movel({vec(up)}, {speed}, EXACT, {line}, {label!r})")
+            out.append(f"job.movel({vec(up)}, EXACT, {line}, {label!r})")
         n_steps += 1
         n_targets += 1
 
@@ -70,16 +68,14 @@ def program_lines(cmds, a):
         blend = "BLEND" if feed_move(c) and feed_move(nxt) else "EXACT"
         where = f"{c.line}, {c.src!r}"
         if c.kind == "line":
-            speed = num(eng.speed_mm_s(c, a))
             if c.instr == "MoveJ":
-                out.append(f"job.movej({vec(c.poses[0])}, {speed}, {where})")
+                out.append(f"job.movej({vec(c.poses[0])}, {where})")
             else:
-                out.append(f"job.movel({vec(c.poses[0])}, {speed}, {blend}, {where})")
+                out.append(f"job.movel({vec(c.poses[0])}, {blend}, {where})")
             last_pose = c.poses[0]
         elif c.kind in ("arc", "circle"):
             call = "circle" if c.kind == "circle" else "movec"
-            out.append(f"job.{call}({vec(c.poses[0])}, {vec(c.poses[1])}, "
-                       f"{num(eng.speed_mm_s(c, a))}, {blend}, {where})")
+            out.append(f"job.{call}({vec(c.poses[0])}, {vec(c.poses[1])}, {blend}, {where})")
             if c.kind == "arc":                 # a full circle ends where it began
                 last_pose = c.poses[1]
         elif c.kind == "dwell":
@@ -113,16 +109,10 @@ def build_script(cmds, a, source: str, summary=(), ip: str = "192.168.58.25", ch
     errors = "\n".join(f"    {k}: {v!r}," for k, v in sorted(eng.ERROR_TEXT.items()))
     rows = [(f"ROBOT_IP = {ip!r}", ""),
             (f"TOOL, USER = {int(a.tool)}, {int(a.user)}", "must be the frames active on the controller"),
-            (f"GLOBAL_SPEED = {int(a.global_speed)}", "%, set before the run; feed rates are only true at 100"),
-            (f"SPEED_MODE = {a.speed_mode!r}", '"physical": mm/s and mm/s^2; "percent": % of MAX_SPEED'),
-            (f"MAX_SPEED = {num(a.max_speed)}", "mm/s cap (in percent mode: the speed that equals 100 %)"),
-            (f"ACC = {num(a.acc)}", "mm/s^2, halved automatically if the controller refuses it"),
-            (f"MIN_ACC = {num(a.min_acc)}", "...but never below this"),
+            (f"GLOBAL_SPEED = {int(a.global_speed)}", "% of full speed for every move (F / S in the G-code are ignored)"),
             (f"BLEND = {num(a.blend)}", "mm, blend radius between moves that run on into each other"),
             ("EXACT = -1.0", "the move ends exactly on its point"),
             (f"QUEUE_MAX = {int(a.queue_max)}", "moves queued on the controller at most"),
-            (f"JOINT_SPEED = {num(a.joint_speed)}", "deg/s, what 100 % joint speed means (for G0 -> MoveJ)"),
-            (f"FIRST_VEL = {num(a.first_vel)}", "% joint speed of the first move, from wherever the arm is"),
             (f"SPINDLE_DO = {int(a.spindle_do)}", "control-box DO switched by M3 / M5 (-1 = none)"),
             (f"START_WAIT = {num(a.start_wait)}", 's to wait for "motion done" to drop after a move is sent'),
             (f"STEPS, TARGETS = {n_steps}, {n_targets}", "")]
@@ -162,7 +152,6 @@ except ImportError:
 # ============================================================================ job settings
 {settings}
 
-ERR_ACC_LIMIT = {eng.ERR_ACC_LIMIT}
 ERROR_TEXT = {{
 {errors}
 }}
@@ -198,7 +187,6 @@ class Job:
         self.robot, self.dry = robot, dry
         self.last_j = None              # joint position of the previous target: the IK reference
         self.last_pose = None           # where the previous move leaves the TCP
-        self.acc = ACC
         self.spindle_on = False
         self.count = 0
         self.problems = []              # dry run: the targets without a joint position
@@ -271,68 +259,47 @@ class Job:
             self.fault()
             time.sleep(0.01)
 
-    def speed(self, mm_s):
-        if SPEED_MODE == "physical":
-            # SetSpeed() does not scale physical mm/s, so apply the global % here (as MoveJ gets it)
-            return dict(vel=100.0, ovl=max(0.1, mm_s * GLOBAL_SPEED / 100.0), oacc=self.acc, velAccParamMode=1)
-        return dict(vel=max(1.0, min(100.0, 100.0 * mm_s / MAX_SPEED)), ovl=100.0, oacc=100.0, velAccParamMode=0)
-
-    def cartesian(self, mm_s, send):
-        """If the controller refuses the acceleration, halve it and send the same move again (a refused
-        move was never queued). The lower value is kept for the rest of the job."""
-        while True:
-            ret = send(self.speed(mm_s))
-            if unpack(ret)[0] != ERR_ACC_LIMIT or SPEED_MODE != "physical" or self.acc <= MIN_ACC:
-                return ret
-            self.acc = max(self.acc / 2.0, MIN_ACC)
-            print(f"  the controller refused the acceleration; continuing with {self.acc:g} mm/s^2")
+    # every move is sent at 100 %: GLOBAL_SPEED (set in prepare) is then the speed of all of them
+    SPEED = dict(vel=100.0, ovl=100.0, oacc=100.0, velAccParamMode=0)
 
     # ---- the steps of the program
-    def movej(self, pose, mm_s, line, src):
-        """G0 -> MoveJ. The joint speed % is chosen so the move lasts about distance / speed."""
-        q0 = self.last_j
+    def movej(self, pose, line, src):
+        """G0 -> MoveJ at 100 % joint speed (scaled by GLOBAL_SPEED like every move)."""
         js = self.joints([pose], line, src)
         if self.dry:
             self.last_pose = pose
             return
-        if self.last_pose is None:
-            pct = FIRST_VEL
-        else:
-            dist = max(math.dist(self.last_pose[:3], pose[:3]), 1e-6)
-            busiest = max(abs(q - p) for p, q in zip(q0, js[0]))
-            pct = min(100.0 * busiest * mm_s / dist / JOINT_SPEED, 100.0 * mm_s / MAX_SPEED)
-        pct = max(1.0, min(100.0, pct))
         self.wait_idle()
-        self.say(line, src, f"MoveJ  {fmt(pose)} @ {pct:.1f} % joint speed")
-        self.check(self.robot.MoveJ(joint_pos=js[0], tool=TOOL, user=USER, desc_pos=pose, vel=pct, blendT=0.0),
+        self.say(line, src, f"MoveJ  {fmt(pose)} @ {GLOBAL_SPEED} %")
+        self.check(self.robot.MoveJ(joint_pos=js[0], tool=TOOL, user=USER, desc_pos=pose, vel=100.0, blendT=0.0),
                    "MoveJ", line)
         self.wait_idle(just_sent=True)
         self.last_pose = pose
 
-    def movel(self, pose, mm_s, blend, line, src):
+    def movel(self, pose, blend, line, src):
         js = self.joints([pose], line, src)
         if not self.dry:
             self.throttle()
-            self.say(line, src, f"MoveL  {fmt(pose)} @ {mm_s:.1f} mm/s")
-            ret = self.cartesian(mm_s, lambda s: self.robot.MoveL(
-                desc_pos=pose, tool=TOOL, user=USER, joint_pos=js[0], blendR=max(blend, 0.0), **s))
+            self.say(line, src, f"MoveL  {fmt(pose)} @ {GLOBAL_SPEED} %")
+            ret = self.robot.MoveL(desc_pos=pose, tool=TOOL, user=USER, joint_pos=js[0],
+                                   blendR=max(blend, 0.0), **self.SPEED)
             self.check(ret, "MoveL", line)
             if blend < 0:
                 self.wait_idle(just_sent=True)
         self.last_pose = pose
 
-    def _arc(self, full, mid, end, mm_s, blend, line, src):
+    def _arc(self, full, mid, end, blend, line, src):
         name = "Circle" if full else "MoveC"
         j_start = self.last_j
         js = self.joints([mid, end], line, src)
         if not self.dry:
             self.throttle()
-            self.say(line, src, f"{name:<6} via {fmt(mid)} to {fmt(end)} @ {mm_s:.1f} mm/s")
+            self.say(line, src, f"{name:<6} via {fmt(mid)} to {fmt(end)} @ {GLOBAL_SPEED} %")
             move = self.robot.Circle if full else self.robot.MoveC
-            ret = self.cartesian(mm_s, lambda s: move(
-                desc_pos_p=mid, tool_p=TOOL, user_p=USER, desc_pos_t=end, tool_t=TOOL, user_t=USER,
-                joint_pos_p=js[0], joint_pos_t=js[1], vel_p=s["vel"], vel_t=s["vel"], ovl=s["ovl"],
-                oacc=s["oacc"], blendR=max(blend, 0.0), velAccParamMode=s["velAccParamMode"]))
+            s = self.SPEED
+            ret = move(desc_pos_p=mid, tool_p=TOOL, user_p=USER, desc_pos_t=end, tool_t=TOOL, user_t=USER,
+                       joint_pos_p=js[0], joint_pos_t=js[1], vel_p=s["vel"], vel_t=s["vel"], ovl=s["ovl"],
+                       oacc=s["oacc"], blendR=max(blend, 0.0), velAccParamMode=s["velAccParamMode"])
             self.check(ret, name, line)
             if blend < 0:
                 self.wait_idle(just_sent=True)
@@ -341,13 +308,13 @@ class Job:
         else:
             self.last_pose = end
 
-    def movec(self, mid, end, mm_s, blend, line, src):
+    def movec(self, mid, end, blend, line, src):
         """G2 / G3 arc: path point, target point."""
-        self._arc(False, mid, end, mm_s, blend, line, src)
+        self._arc(False, mid, end, blend, line, src)
 
-    def circle(self, mid, end, mm_s, blend, line, src):
+    def circle(self, mid, end, blend, line, src):
         """G2 / G3 full circle: the points at 1/4 and 1/2 turn; it finishes back at its start."""
-        self._arc(True, mid, end, mm_s, blend, line, src)
+        self._arc(True, mid, end, blend, line, src)
 
     def dwell(self, seconds, line, src):
         if self.dry:
@@ -483,33 +450,19 @@ def build_simple_script(cmds, a, source: str, summary=(), ip: str = "192.168.58.
     if not motions:
         raise ValueError("The plan has no moves to export.")
     first, lift = motions[0], float(a.approach or 0.0)
-    physical = a.speed_mode == "physical"
     do = int(a.spindle_do)
     body, moved, spindle_on = [], [False], False
 
-    def speed(c):
-        mm_s = eng.speed_mm_s(c, a)
-        if physical:   # SetSpeed() does not scale physical mm/s, so the global % is applied here
-            return f"vel=100, ovl={short(max(0.1, mm_s * a.global_speed / 100.0))}, oacc=ACC"
-        return f"vel={short(max(1.0, min(100.0, 100.0 * mm_s / a.max_speed)))}"
-
-    def mode():
-        return ", velAccParamMode=1" if physical else ""
-
+    # every move at vel=100 %: robot.SetSpeed(<global %>) below is the speed of all of them
     def movej(pose, c, label):
-        # joint speed %: the first move goes slowly from wherever the arm is; later G0 moves at the
-        # G0 speed as a share of MAX_SPEED (the upper limit the app uses)
-        vel = a.first_vel if not moved[0] else max(1.0, min(100.0, 100.0 * eng.speed_mm_s(c, a) / a.max_speed))
         moved[0] = True
         body.append(f"# {label}")
         body.append(f"p = {svec(pose)}")
-        body.append(f"robot.MoveJ(joint_pos=joints_for(p), tool=TOOL, user=USER, desc_pos=p, "
-                    f"vel={short(vel)}, blendT=-1)")
+        body.append("robot.MoveJ(joint_pos=joints_for(p), tool=TOOL, user=USER, desc_pos=p, vel=100, blendT=-1)")
 
     def movel(pose, c, comment):
         body.append(f"# {comment}")
-        body.append(f"robot.MoveL(desc_pos={svec(pose)}, tool=TOOL, user=USER,\n"
-                    f"            {speed(c)}, blendR=-1{mode()})")
+        body.append(f"robot.MoveL(desc_pos={svec(pose)}, tool=TOOL, user=USER, vel=100, blendR=-1)")
 
     def where(c):
         return f"N{c.line} {c.src}"
@@ -533,14 +486,11 @@ def build_simple_script(cmds, a, source: str, summary=(), ip: str = "192.168.58.
             moved[0], last_pose = True, c.poses[0]
         elif c.kind in ("arc", "circle"):
             name = "Circle" if c.kind == "circle" else "MoveC"
-            vel, _, rest = speed(c).partition(", ")             # "vel=100", "ovl=15.0, oacc=ACC"
-            v = vel.split("=", 1)[1]
-            sp = f"vel_p={v}, vel_t={v}" + (f", {rest}" if rest else "")
             pad = " " * (len(name) + 7)
             body.append(f"# {where(c)}")
             body.append(f"robot.{name}(desc_pos_p={svec(c.poses[0])}, tool_p=TOOL, user_p=USER,\n"
                         f"{pad}desc_pos_t={svec(c.poses[1])}, tool_t=TOOL, user_t=USER,\n"
-                        f"{pad}{sp}, blendR=-1{mode()})")
+                        f"{pad}vel_p=100, vel_t=100, blendR=-1)")
             moved[0] = True
             if c.kind == "arc":
                 last_pose = c.poses[1]
@@ -573,8 +523,6 @@ def build_simple_script(cmds, a, source: str, summary=(), ip: str = "192.168.58.
     head = "\n".join(summary)
     notes = f"\n{note}\n" if note else ""
     rows = [(f"TOOL, USER = {int(a.tool)}, {int(a.user)}", "must be the frames active on the controller")]
-    if physical:
-        rows.append((f"ACC = {short(a.acc)}", "mm/s^2 - lower it if a move fails with error 183"))
     width = max(len(code) for code, _ in rows) + 2
     settings = [code.ljust(width) + "# " + why for code, why in rows]
     return f'''"""
@@ -606,7 +554,7 @@ if input("The robot will MOVE. Type yes to start: ").strip().lower() != "yes":
 
 robot.Mode(0)            # automatic mode
 robot.RobotEnable(1)
-robot.SetSpeed({int(a.global_speed):<3})      # global speed %; G-code feed rates are only true at 100
+robot.SetSpeed({int(a.global_speed):<3})      # % of full speed for every move (F / S in the G-code are ignored)
 
 try:
 ''' + "\n".join(("    " + line).replace("\n", "\n    ") for line in body) + '''
@@ -623,7 +571,7 @@ def export_cmds(cmds, a, source: str, path: str, summary=(), ip: str = "192.168.
                 note: str = "", style: str = "simple") -> str:
     """Write planned commands (after eng.plan()) and their settings to `path` as a stand-alone script.
     style "simple": a flat list of SDK calls; "checked": the same commands with the app's runtime
-    (pre-flight frame and reach check, IK referenced to the previous target, acceleration retry)."""
+    (pre-flight frame and reach check, IK referenced to the previous target)."""
     if style == "simple":
         text = build_simple_script(cmds, a, source, summary, ip, note)
     else:

@@ -43,8 +43,7 @@ class RunSetup:
     rpy: List[float] = field(default_factory=lambda: [180.0, 0.0, 0.0])
     tool: int = 0
     user: int = 0
-    global_speed: int = 20                  # %, deliberately slow by default
-    rapid_speed: Optional[float] = None     # mm/s for G0; None = the file's S word
+    global_speed: int = 20                  # % of full speed for every move; deliberately slow by default
     approach: float = 20.0                  # mm above the first / last point; 0 = none
     spindle_do: int = -1                    # control-box DO for M3/M5; -1 = none
     auto_range: float = 500.0               # AUTO: search this far (mm) around the tool tip
@@ -66,7 +65,7 @@ class RunSetup:
         a.origin = list(self.origin) if self.placement == MANUAL else None
         a.rpy = list(self.rpy)
         a.tool, a.user = (self.tool, self.user) if self.placement == MANUAL else (0, 0)
-        a.global_speed, a.rapid_speed = int(self.global_speed), self.rapid_speed
+        a.global_speed = int(self.global_speed)
         a.approach, a.spindle_do = float(self.approach), int(self.spindle_do)
         a.quiet, a.dry_run = False, False
         return a
@@ -201,8 +200,6 @@ class RunSetupDialog(QtWidgets.QDialog):
         self.global_speed.setRange(1, 100)
         self.global_speed.setValue(setup.global_speed)
         self.global_speed.setSuffix(" %")
-        self.rapid = spin(setup.rapid_speed or 0.0, 0.0, 2000.0, 10.0, 0, " mm/s")
-        self.rapid.setSpecialValueText("from the file's S word")
         self.approach = spin(setup.approach, 0.0, 500.0, 5.0, 1, " mm")
         self.approach.setSpecialValueText("none (as the WebApp)")
         self.spindle_do = QtWidgets.QSpinBox()
@@ -212,11 +209,11 @@ class RunSetupDialog(QtWidgets.QDialog):
 
         run = QtWidgets.QGroupBox("How it runs")
         form = QtWidgets.QFormLayout(run)
-        form.addRow("Global speed", self.global_speed)
-        hint = note("Feed rates (F) are only true at 100 %. Start low for a first run.")
+        form.addRow("Speed", self.global_speed)
+        hint = note("Every move runs at this % of the robot's full speed.\n"
+                    "F and S in the G-code are ignored. Start low for a first run.")
         hint.setStyleSheet("color: #6b7280;")
         form.addRow("", hint)
-        form.addRow("Rapid (G0) speed", self.rapid)
         form.addRow("Approach / retract height", self.approach)
         form.addRow("Output for M3 / M5 (DO)", self.spindle_do)
 
@@ -279,7 +276,7 @@ class RunSetupDialog(QtWidgets.QDialog):
                      AUTO if self.by_auto.isChecked() else MANUAL)
         return RunSetup(placement, self.ref_point.text().strip(), [w.value() for w in self.origin],
                         [w.value() for w in self.rpy], self.tool.value(), self.user.value(),
-                        self.global_speed.value(), self.rapid.value() or None, self.approach.value(),
+                        self.global_speed.value(), self.approach.value(),
                         self.spindle_do.value(), self.auto_range.value(), self.auto_rotate.isChecked(),
                         self.yaw.value(), self.turn_posture.isChecked(), self.tool_down.isChecked())
 
@@ -403,7 +400,7 @@ class Job(QtCore.QThread):
             elif self.mode == "check":
                 result.ok, result.message = True, "Plan checked: the whole path is reachable."
             else:
-                self.log.emit(f"Starting. Global speed {a.global_speed} %.")
+                self.log.emit(f"Starting. Speed {a.global_speed} % for every move.")
                 moving = True
                 streamer.prepare()
                 streamer.run(plan.cmds)

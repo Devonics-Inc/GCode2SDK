@@ -6,15 +6,18 @@ It does what the WebApp "G-code Conversion" tool does (manual 14.8), but sends t
 straight to the controller instead of writing a LUA file, and prints every command as it goes.
 
 Supported G-code:
-    G0               rapid move          -> MoveJ  (speed = S word read as mm/min)
-    G1               linear move         -> MoveL  (speed = F, mm/min)
-    G2 / G3          XY arc (I/J or R)   -> MoveC  (speed = F)
-    G2 / G3          full XY circle      -> Circle (speed = F)
+    G0               rapid move          -> MoveJ
+    G1               linear move         -> MoveL
+    G2 / G3          XY arc (I/J or R)   -> MoveC
+    G2 / G3          full XY circle      -> Circle
     G4 P/S           dwell
     G17 G20 G21 G90 G91
     M3/M4/M5         spindle/laser/pen on/off -> control-box DO (--spindle-do)
     M0/M1            pause (press Enter)   M2/M30 end of program
 Anything else is reported as a warning and ignored.
+
+Speed: every move runs at one speed, --global-speed % of the robot's full speed (the controller's
+global speed, like the WebApp speed slider). F and S words in the file are ignored.
 
 How coordinates are mapped:
     WebApp mode (--ref-point NAME): G-code XYZ are coordinates in the workpiece frame of the saved
@@ -317,15 +320,10 @@ def plan(cmds, frame, a):
     return follow
 
 
-def speed_mm_s(c, a, cap=True):
-    """TCP speed of a motion: F for G1/G2/G3; for G0 the S word (--rapid-speed overrides it)."""
-    if not c.rapid:
-        v = c.feed / 60.0
-    elif a.rapid_speed is not None:
-        v = a.rapid_speed
-    else:
-        v = c.spindle / 60.0 if c.spindle > 0 else 100.0
-    return max(0.1, min(v, a.max_speed)) if cap else v
+def speed_mm_s(c, a):
+    """Estimated TCP speed of a motion, for time estimates and previews only. Every move runs at the
+    global speed % of the robot's full speed (--max-speed = its TCP speed at 100 %); F and S are ignored."""
+    return max(0.1, a.max_speed * a.global_speed / 100.0)
 
 
 def describe(c, a, note=""):
@@ -344,12 +342,12 @@ def describe(c, a, note=""):
         return "[" + ", ".join(f"{round(v, 3) + 0.0:.3f}" for v in p) + "]"
 
     pts = fmt(c.poses[0]) if len(c.poses) == 1 else f"via {fmt(c.poses[0])} to {fmt(c.poses[1])}"
-    return head + f"{c.instr:<6} {pts} @ {speed_mm_s(c, a):.1f} mm/s{note}"
+    return head + f"{c.instr:<6} {pts} @ {a.global_speed} %{note}"
 
 
 def summarize(cmds, frame, a, follow, out=print):
     """Report the plan through out() (one line per call) and return its bounding box (lo, hi)."""
-    pts, length, seconds, capped, count = [], 0.0, 0.0, 0, {}
+    pts, length, seconds, count = [], 0.0, 0.0, {}
     for c in cmds:
         if c.kind not in MOTION_KINDS:
             if c.kind == "dwell":
@@ -359,7 +357,6 @@ def summarize(cmds, frame, a, follow, out=print):
         d = sum(math.dist(p, q) for p, q in zip(seq, seq[1:])) * frame.scale
         length += d
         seconds += d / speed_mm_s(c, a)
-        capped += speed_mm_s(c, a, cap=False) > a.max_speed
         count[c.instr] = count.get(c.instr, 0) + 1
         pts += [frame.pose(p)[:3] for p in seq[1:]]
     if not pts:
@@ -372,10 +369,9 @@ def summarize(cmds, frame, a, follow, out=print):
     out("Posture         : " + (f"follows the path tangent (tool tilted {frame.tilt_deg():.1f} deg)"
                                 if follow else f"fixed {[round(v, 3) for v in frame.rpy]}"))
     out("Instructions    : " + ", ".join(f"{k} x{v}" for k, v in sorted(count.items())))
+    out(f"Speed           : {a.global_speed} % of full speed for every move (F / S in the file are ignored)")
     out(f"Path length     : {length:.1f} mm   (est. {seconds / 60:.1f} min)")
     out(f"Frame bbox      : X {lo[0]:.1f}..{hi[0]:.1f}  Y {lo[1]:.1f}..{hi[1]:.1f}  Z {lo[2]:.1f}..{hi[2]:.1f} mm")
-    if capped:
-        out(f"warning: {capped} moves ask for more than --max-speed {a.max_speed:g} mm/s and are capped")
     return lo, hi
 
 
@@ -416,8 +412,8 @@ ERROR_TEXT = {
     151: "the joint configuration changes between the current and the target position",
     153: "arc points are too close together", 170: "the workpiece frame is not applied",
     171: "a joint is beyond its soft limit", 172: "the speed cannot be 0",
-    ERR_SPEED_LIMIT: "the speed in mm/s is above the controller's limit - lower --max-speed or the feed",
-    ERR_ACC_LIMIT: "the acceleration in mm/s^2 is above the controller's limit - lower --acc",
+    ERR_SPEED_LIMIT: "the speed is above the controller's limit - lower --global-speed",
+    ERR_ACC_LIMIT: "the acceleration is above the controller's limit - lower --global-speed",
     185: "a fault signal stopped the motion", 186: "the emergency stop stopped the motion",
     204: "the controller's command queue is full",
 }
@@ -567,14 +563,11 @@ class Streamer:
         elif self.sent % 200 == 1:
             print(f"  sent {self.sent}/{self.total} (G-code line {c.line})")
 
-    def speed(self, c):
-        mm_s = speed_mm_s(c, self.a)
-        if self.a.speed_mode == "physical":   # ovl = mm/s, oacc = mm/s^2
-            # SetSpeed() does not scale physical mm/s, so apply the global % here (as MoveJ gets it)
-            g = self.a.global_speed / 100.0
-            return dict(vel=100.0, ovl=max(0.1, mm_s * g), oacc=self.a.acc, velAccParamMode=1)
-        pct = max(1.0, min(100.0, 100.0 * mm_s / self.a.max_speed))
-        return dict(vel=pct, ovl=100.0, oacc=100.0, velAccParamMode=0)
+    @staticmethod
+    def speed():
+        """Every Cartesian move at 100 % in percent mode: the global speed set in prepare() is then
+        the one speed of the whole job (F / S in the file are ignored)."""
+        return dict(vel=100.0, ovl=100.0, oacc=100.0, velAccParamMode=0)
 
     def throttle(self):
         """Keep the controller's motion queue from overflowing while blending."""
@@ -619,37 +612,21 @@ class Streamer:
 
     # ---- motion
     def move_joint(self, c):
-        """G0 -> MoveJ, as the WebApp does. MoveJ only takes a joint-speed %, so use the % that makes
-        the move last distance / speed (never more than speed / --max-speed)."""
+        """G0 -> MoveJ, as the WebApp does, at 100 % joint speed: the global speed scales it like
+        every other move."""
         pose = c.poses[0]
-        q0, joints = self.last_j, self.ik(pose, c.line)
-        mm_s = speed_mm_s(c, self.a)
-        if self.last_pose is None:           # first move, from wherever the arm happens to be
-            pct = self.a.first_vel
-        else:
-            dist = max(math.dist(self.last_pose[:3], pose[:3]), 1e-6)
-            busiest = max(abs(q - p) for p, q in zip(q0, joints))          # deg
-            pct = min(100.0 * busiest * mm_s / dist / self.a.joint_speed, 100.0 * mm_s / self.a.max_speed)
-        pct = max(1.0, min(100.0, pct))
+        joints = self.ik(pose, c.line)
         self.wait_idle()
-        self.trace(c, f" = {pct:.1f} % joint speed")
+        self.trace(c)
         ret = self.robot.MoveJ(joint_pos=joints, tool=self.a.tool, user=self.a.user, desc_pos=pose,
-                               vel=pct, blendT=self.exact(-1.0))
+                               vel=100.0, blendT=self.exact(-1.0))
         self.check(ret, "MoveJ", c.line)
         self.settle(-1.0)
         self.last_pose = pose
 
     def cartesian(self, c, send):
-        """Send a MoveL / MoveC / Circle through send(speed settings). If the controller refuses the
-        acceleration (it has a limit that is not documented and differs between robots), halve it and
-        send the same move again - a refused move was never queued. The lower value is then kept."""
-        while True:
-            ret = send(self.speed(c))
-            if (unpack(ret)[0] != ERR_ACC_LIMIT or self.a.speed_mode != "physical"
-                    or self.a.acc <= self.a.min_acc):
-                return ret
-            self.a.acc = max(self.a.acc / 2.0, self.a.min_acc)
-            self.log(f"  the controller refused the acceleration; continuing with {self.a.acc:g} mm/s^2")
+        """Send a MoveL / MoveC / Circle through send(speed settings)."""
+        return send(self.speed())
 
     def move_line(self, c, blend):
         pose = c.poses[0]
@@ -780,7 +757,7 @@ class Streamer:
         self.check_robot_fault()
         self.check(self.robot.Mode(0), "Mode(auto)")
         self.check(self.robot.RobotEnable(1), "RobotEnable")
-        # same rule as the WebApp: F and S are only true with the global speed at 100 %
+        # the one speed of the job: every move is sent at 100 %, so this % is the speed of all of them
         self.check(self.robot.SetSpeed(self.a.global_speed), "SetSpeed")
         time.sleep(0.5)
         self.last_j = self.current_joints()
@@ -871,7 +848,7 @@ def build_parser():
                    help="use the current TCP pose as origin and orientation")
     p.add_argument("--yaw", type=float, default=0.0, help="rotate G-code XY about Z (deg)")
     p.add_argument("--scale", type=float, default=1.0)
-    p.add_argument("--feed", type=float, default=600.0, help="default feed mm/min if file has no F")
+    p.add_argument("--feed", type=float, default=600.0, help=argparse.SUPPRESS)   # F is read but not used
     p.add_argument("--posture", choices=["auto", "tangent", "fixed"], default="auto",
                    help="tangent: the tool turns with the path like the WebApp; fixed: never turns; "
                         "auto: tangent unless the tool is perpendicular to the plane")
@@ -880,21 +857,10 @@ def build_parser():
     p.add_argument("--arc-split", type=float, default=360.0, metavar="DEG",
                    help="split arcs into MoveC pieces of at most DEG (360 = one MoveC per arc and "
                         "Circle for full circles, like the WebApp)")
-    p.add_argument("--rapid-speed", type=float, default=None,
-                   help="G0 speed in mm/s; default: the S word of the file (as mm/min), else 100")
-    p.add_argument("--joint-speed", type=float, default=180.0,
-                   help="max joint speed of the robot in deg/s, used to turn the G0 speed into a MoveJ %%")
-    p.add_argument("--first-vel", type=float, default=10.0,
-                   help="joint speed %% of the first MoveJ, from wherever the arm is")
-    p.add_argument("--global-speed", type=int, default=100,
-                   help="global speed %% set before the run; F/S are only true at 100 (WebApp rule)")
+    p.add_argument("--global-speed", type=int, default=20,
+                   help="speed of every move, %% of the robot's full speed (F / S in the file are ignored)")
     p.add_argument("--max-speed", type=float, default=250.0,
-                   help="speed cap mm/s (in percent mode: the speed that equals 100%%)")
-    p.add_argument("--acc", type=float, default=200.0,
-                   help="TCP acceleration mm/s^2 (physical mode); halved automatically if the controller "
-                        "refuses it")
-    p.add_argument("--min-acc", type=float, default=10.0, help=argparse.SUPPRESS)
-    p.add_argument("--speed-mode", choices=["physical", "percent"], default="physical")
+                   help="the robot's TCP speed in mm/s at 100 %%; only used to estimate the run time")
     p.add_argument("--blend", type=float, default=0.5, help="blend radius mm between moves")
     p.add_argument("--queue-max", type=int, default=20, help="max queued motions on the controller")
     p.add_argument("--start-wait", type=float, default=0.6, help=argparse.SUPPRESS)   # see wait_idle()
