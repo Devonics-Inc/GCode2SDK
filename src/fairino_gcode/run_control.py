@@ -22,7 +22,7 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
-from matplotlib.backends.qt_compat import QtCore, QtWidgets
+from matplotlib.backends.qt_compat import QtCore, QtGui, QtWidgets
 
 from . import auto_place
 from . import gcode_to_fairino as eng
@@ -228,15 +228,44 @@ class RunSetupDialog(QtWidgets.QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
+        # the settings scroll on small screens; the message and the buttons always stay in view
+        content = QtWidgets.QWidget()
+        inner = QtWidgets.QVBoxLayout(content)
+        inner.setContentsMargins(0, 0, 0, 0)
+        inner.addWidget(place)
+        inner.addWidget(hold)
+        inner.addWidget(run)
+        inner.addStretch(1)
+        self.scroll = QtWidgets.QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.scroll.setWidget(content)
+
         outer = QtWidgets.QVBoxLayout(self)
-        outer.addWidget(place)
-        outer.addWidget(hold)
-        outer.addWidget(run)
+        outer.addWidget(self.scroll, 1)
         outer.addWidget(self.message)
         outer.addWidget(buttons)
         for button in (self.by_ref, self.by_here, self.by_auto, self.by_manual, self.auto_rotate):
             button.toggled.connect(self._enable)
         self._enable()
+        self._fit_to_screen(content, parent)
+
+    def _fit_to_screen(self, content, parent):
+        """Open as big as the settings need, but never bigger than the screen the dialog is on.
+        (A QScrollArea asks for a small default size, so the size is set here.)"""
+        screen = (parent.screen() if parent is not None else None) or QtGui.QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        avail = screen.availableGeometry()
+        bar = self.style().pixelMetric(QtWidgets.QStyle.PixelMetric.PM_ScrollBarExtent)
+        m = self.layout().contentsMargins()
+        spacing = self.layout().spacing()
+        need = content.sizeHint()
+        extra_h = (self.message.sizeHint().height() + self.layout().itemAt(2).widget().sizeHint().height()
+                   + 2 * spacing + m.top() + m.bottom())
+        width = need.width() + bar + m.left() + m.right()
+        height = need.height() + extra_h
+        self.resize(min(width, int(avail.width() * 0.95)), min(height, int(avail.height() * 0.90)))
 
     def _enable(self):
         self.ref_point.setEnabled(self.by_ref.isChecked())
