@@ -261,7 +261,10 @@ class SpeedView(QtWidgets.QWidget):
             written.append(path)
         else:
             samples = path
-        owner = self._owner if len(self._owner) == len(self.recorder) else [None] * len(self.recorder)
+        # samples recorded after the run was analysed (the robot stays connected) belong to no command;
+        # the ones before keep the command they were matched to
+        n = len(self.recorder)
+        owner = (list(self._owner) + [None] * n)[:n]
         write_samples_csv(samples, self.recorder, owner, self._plan)
         written.append(samples)
         return written

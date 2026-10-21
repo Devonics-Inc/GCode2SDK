@@ -227,9 +227,14 @@ def test_a_run_in_mm_s_measures_every_command_and_exports_it(qapp, tmp_path):
     # selecting a row shades its stretch of the graph
     win.table.selectRow(k)
     assert win.speed._span is not None
+    # the robot stays connected: more samples come in after the run was analysed (as on the real robot)
+    analysed = len(win.speed._owner)
+    assert wait_until(lambda: len(win.speed.recorder) > analysed + 5, 5)
     written = win.speed.export(str(tmp_path / "run.csv"))
     rows = open(written[0]).read().splitlines()
     assert rows[0].startswith("#,G-code line") and len(rows) == len(win.checked.motions) + 1
     samples = open(written[1]).read().splitlines()
-    assert len(samples) == len(win.speed.recorder) + 1 and any(",feed," in r for r in samples[1:])
+    assert len(samples) >= len(win.speed.recorder) and any(",feed," in r for r in samples[1:])
+    numbered = [r for r in samples[1:] if r.split(",")[6]]
+    assert len(numbered) > 100                              # the run's samples keep their command number
     win.close()
