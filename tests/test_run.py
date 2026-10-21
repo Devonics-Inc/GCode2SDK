@@ -137,7 +137,7 @@ def test_emergency_stop_tries_again_when_the_first_call_fails():
 def test_refused_acceleration_is_halved_and_the_move_sent_again():
     """Seen on the real controller: MoveL answered 183 (acceleration above its limit)."""
     sim = sim_robot.SimRobot(time_scale=50)
-    s, plan = streamer_for(sim, DEMO, approach=0.0, acc=400.0)
+    s, plan = streamer_for(sim, DEMO, approach=0.0, acc=400.0, speed_mode="physical")
     logged = []
     s.log = logged.append
     sim.fail_next = {"MoveL": 183}
@@ -154,7 +154,7 @@ def test_refused_acceleration_is_halved_and_the_move_sent_again():
 
 def test_error_codes_are_explained():
     sim = sim_robot.SimRobot(time_scale=50)
-    s, plan = streamer_for(sim, DEMO, approach=0.0, acc=10.0)                  # already at the floor: no retry
+    s, plan = streamer_for(sim, DEMO, approach=0.0, acc=10.0, speed_mode="physical")    # at the floor: no retry
     sim.fail_next = {"MoveL": 183}
     s.prepare()
     with pytest.raises(eng.RobotCommandError, match="183: the acceleration .* above the controller's limit"):
@@ -238,9 +238,21 @@ def test_setup_dialog_round_trip_and_validation(qapp):
     dialog.global_speed.setValue(40)
     dialog.accept()
     assert dialog.chosen.placement == MANUAL and dialog.chosen.origin[0] == 250.5
-    assert dialog.chosen.global_speed == 40 and dialog.chosen.rapid_speed is None
+    assert dialog.chosen.global_speed == 40 and dialog.chosen.speed_mode == "percent"
     a = dialog.chosen.apply(default_settings())
     assert a.origin == [250.5, 0.0, 200.0] and not a.origin_here and a.ref_point is None
+    # constant TCP speed: the mm/s fields are only editable in that mode, and reach the engine
+    again = RunSetupDialog(dialog.chosen)
+    assert not again.physical_box.isEnabled()
+    again.by_physical.setChecked(True)
+    assert again.physical_box.isEnabled()
+    again.tcp_speed.setValue(35.0)
+    again.acc.setValue(500.0)
+    again.blend.setValue(2.0)
+    again.accept()
+    a = again.chosen.apply(default_settings())
+    assert (a.speed_mode, a.tcp_speed, a.acc, a.blend, a.global_speed) == ("physical", 35.0, 500.0, 2.0, 40)
+    assert "TCP speed 35 mm/s" in again.chosen.describe() and RunSetupDialog(again.chosen).by_physical.isChecked()
 
 
 # ------------------------------------------------------------------ window

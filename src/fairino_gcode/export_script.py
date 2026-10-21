@@ -113,7 +113,12 @@ def build_script(cmds, a, source: str, summary=(), ip: str = "192.168.58.25", ch
     errors = "\n".join(f"    {k}: {v!r}," for k, v in sorted(eng.ERROR_TEXT.items()))
     rows = [(f"ROBOT_IP = {ip!r}", ""),
             (f"TOOL, USER = {int(a.tool)}, {int(a.user)}", "must be the frames active on the controller"),
-            (f"GLOBAL_SPEED = {int(a.global_speed)}", "% of full speed for every move (F / S in the G-code are ignored)"),
+            (f"GLOBAL_SPEED = {int(a.global_speed)}",
+             "% of full speed: every move, or only MoveJ when SPEED_MODE is physical (F / S are ignored)"),
+            (f"SPEED_MODE = {('physical' if eng.physical(a) else 'percent')!r}",
+             '"physical": MoveL / MoveC / Circle at TCP_SPEED mm/s and ACC mm/s^2'),
+            (f"TCP_SPEED = {num(getattr(a, 'tcp_speed', 20.0))}", "mm/s (physical mode)"),
+            (f"ACC = {num(getattr(a, 'acc', 200.0))}", "mm/s^2 (physical mode) - lower it if a move fails with 183"),
             (f"BLEND = {num(a.blend)}", "mm, blend radius between moves that run on into each other"),
             ("EXACT = -1.0", "the move ends exactly on its point"),
             (f"QUEUE_MAX = {int(a.queue_max)}", "moves queued on the controller at most"),
@@ -181,6 +186,9 @@ def unpack(ret):
 
 def fmt(p):
     return "[" + ", ".join(f"{round(v, 3) + 0.0:.3f}" for v in p) + "]"
+
+
+FEED_SPEED = f"{TCP_SPEED:g} mm/s" if SPEED_MODE == "physical" else f"{GLOBAL_SPEED} %"   # MoveL / MoveC / Circle
 
 
 class Job:
@@ -263,8 +271,10 @@ class Job:
             self.fault()
             time.sleep(0.01)
 
-    # every move is sent at 100 %: GLOBAL_SPEED (set in prepare) is then the speed of all of them
-    SPEED = dict(vel=100.0, ovl=100.0, oacc=100.0, velAccParamMode=0)
+    # percent: every move at 100 %, so GLOBAL_SPEED (set in prepare) is the speed of all of them.
+    # physical: ovl = TCP speed in mm/s, oacc = acceleration in mm/s^2; GLOBAL_SPEED does not scale them.
+    SPEED = (dict(vel=100.0, ovl=TCP_SPEED, oacc=ACC, velAccParamMode=1) if SPEED_MODE == "physical"
+             else dict(vel=100.0, ovl=100.0, oacc=100.0, velAccParamMode=0))
 
     # ---- the steps of the program
     def movej(self, pose, line, src):
@@ -284,7 +294,7 @@ class Job:
         js = self.joints([pose], line, src)
         if not self.dry:
             self.throttle()
-            self.say(line, src, f"MoveL  {fmt(pose)} @ {GLOBAL_SPEED} %")
+            self.say(line, src, f"MoveL  {fmt(pose)} @ {FEED_SPEED}")
             ret = self.robot.MoveL(desc_pos=pose, tool=TOOL, user=USER, joint_pos=js[0],
                                    blendR=max(blend, 0.0), **self.SPEED)
             self.check(ret, "MoveL", line)
@@ -298,7 +308,7 @@ class Job:
         js = self.joints([mid, end], line, src)
         if not self.dry:
             self.throttle()
-            self.say(line, src, f"{name:<6} via {fmt(mid)} to {fmt(end)} @ {GLOBAL_SPEED} %")
+            self.say(line, src, f"{name:<6} via {fmt(mid)} to {fmt(end)} @ {FEED_SPEED}")
             move = self.robot.Circle if full else self.robot.MoveC
             s = self.SPEED
             ret = move(desc_pos_p=mid, tool_p=TOOL, user_p=USER, desc_pos_t=end, tool_t=TOOL, user_t=USER,
@@ -456,6 +466,9 @@ def build_simple_script(cmds, a, source: str, summary=(), ip: str = "192.168.58.
     first, lift = motions[0], float(a.approach or 0.0)
     do = int(a.spindle_do)
     body, moved, spindle_on = [], [False], False
+    # physical mode: MoveL / MoveC / Circle at TCP_SPEED mm/s and ACC mm/s^2 instead of the global %
+    phys = eng.physical(a)
+    units = ", ovl=TCP_SPEED, oacc=ACC, velAccParamMode=1" if phys else ""
 
     # every move at vel=100 %: robot.SetSpeed(<global %>) below is the speed of all of them
     def movej(pose, c, label):
@@ -466,7 +479,7 @@ def build_simple_script(cmds, a, source: str, summary=(), ip: str = "192.168.58.
 
     def movel(pose, c, comment):
         body.append(f"# {comment}")
-        body.append(f"robot.MoveL(desc_pos={svec(pose)}, tool=TOOL, user=USER, vel=100, blendR=-1)")
+        body.append(f"robot.MoveL(desc_pos={svec(pose)}, tool=TOOL, user=USER, vel=100, blendR=-1{units})")
 
     def where(c):
         return f"N{c.line} {c.src}"
@@ -494,7 +507,7 @@ def build_simple_script(cmds, a, source: str, summary=(), ip: str = "192.168.58.
             body.append(f"# {where(c)}")
             body.append(f"robot.{name}(desc_pos_p={svec(c.poses[0])}, tool_p=TOOL, user_p=USER,\n"
                         f"{pad}desc_pos_t={svec(c.poses[1])}, tool_t=TOOL, user_t=USER,\n"
-                        f"{pad}vel_p=100, vel_t=100, blendR=-1)")
+                        f"{pad}vel_p=100, vel_t=100, blendR=-1{units})")
             moved[0] = True
             if c.kind == "arc":
                 last_pose = c.poses[1]
@@ -527,6 +540,9 @@ def build_simple_script(cmds, a, source: str, summary=(), ip: str = "192.168.58.
     head = "\n".join(summary)
     notes = f"\n{note}\n" if note else ""
     rows = [(f"TOOL, USER = {int(a.tool)}, {int(a.user)}", "must be the frames active on the controller")]
+    if phys:
+        rows += [(f"TCP_SPEED = {short(a.tcp_speed)}", "mm/s, every MoveL / MoveC / Circle"),
+                 (f"ACC = {short(a.acc)}", "mm/s^2 - lower it if a move fails with error 183")]
     width = max(len(code) for code, _ in rows) + 2
     settings = [code.ljust(width) + "# " + why for code, why in rows]
     return f'''"""
@@ -558,7 +574,7 @@ if input("The robot will MOVE. Type yes to start: ").strip().lower() != "yes":
 
 robot.Mode(0)            # automatic mode
 robot.RobotEnable(1)
-robot.SetSpeed({int(a.global_speed):<3})      # % of full speed for every move (F / S in the G-code are ignored)
+robot.SetSpeed({int(a.global_speed):<3})      # % of full speed: {'MoveJ only' if phys else 'every move'}
 
 try:
 ''' + "\n".join(("    " + line).replace("\n", "\n    ") for line in body) + '''

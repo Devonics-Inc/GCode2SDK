@@ -26,12 +26,15 @@ No Qt in here - speed_view.py draws it.
 """
 from __future__ import annotations
 
+import csv
 import math
 from bisect import bisect_right
 from collections import deque
 from dataclasses import dataclass
 from statistics import median
 from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
 
 from . import gcode_to_fairino as eng
 
@@ -62,6 +65,7 @@ class SpeedStats:
     high: Optional[float] = None
     within: Optional[float] = None      # % of the moving time inside the band
     excursions: int = 0                 # times the speed left the band while moving
+    source: str = "median"              # where the reference comes from: "typed", "commanded", "median"
 
     @property
     def cv(self) -> Optional[float]:
@@ -87,6 +91,7 @@ class SpeedRecorder:
         self.v: deque = deque(maxlen=max_samples)
         self._t0: Optional[float] = None
         self._marks: List[Tuple[float, str]] = []      # (time, FEED / RAPID) - see mark()
+        self.commanded: Optional[float] = None          # mm/s the job commands (mm/s mode), else None
 
     def __len__(self):
         return len(self.v)
@@ -168,15 +173,22 @@ class SpeedRecorder:
         return [k for k, (v, phase) in enumerate(zip(self.v, self.phases())) if v > MOVING_MM_S and phase != RAPID]
 
     def reference(self, custom: Optional[float] = None) -> Tuple[Optional[float], bool]:
-        """(reference speed, True if it is the automatic one)."""
+        """(reference speed, True if it is the automatic median). A typed-in value first, then the speed the
+        job commands (self.commanded, mm/s mode), else the median of the moving speeds."""
         if custom:
             return float(custom), False
+        if self.commanded:
+            return float(self.commanded), False
         moving = [self.v[k] for k in self.moving()]
         return (median(moving) if moving else None), True
 
+    def reference_source(self, custom: Optional[float] = None) -> str:
+        return "typed" if custom else "commanded" if self.commanded else "median"
+
     def stats(self, custom_reference: Optional[float] = None, tolerance: float = 10.0) -> SpeedStats:
         ref, auto = self.reference(custom_reference)
-        s = SpeedStats(now=self.v[-1] if self.v else None, reference=ref, auto=auto, tolerance=tolerance)
+        s = SpeedStats(now=self.v[-1] if self.v else None, reference=ref, auto=auto, tolerance=tolerance,
+                       source=self.reference_source(custom_reference))
         idx = self.moving()
         if not idx:
             return s
@@ -284,3 +296,124 @@ def target_summary(found: Dict[int, TargetSpeed], total: int, tolerance: float) 
         text += (f"; {len(corners)} blended: slowest {worst.speed:.1f} mm/s ({worst.deviation:+.0f} %)"
                  f" at #{k + 1}, {off} outside ±{tolerance:g} %")
     return text
+
+
+# ============================================================================ speed of every command
+# Which command was the arm executing when a sample was taken? Not the one being SENT then: blended
+# moves are queued up to --queue-max ahead. So each sample is matched by POSITION: to the nearest
+# planned path of the feed commands, walking forward through the plan (never back).
+MATCH_MM = 2.0          # + the blend radius: how far from the planned path a sample may be and still count
+LOOK_AHEAD = 8          # commands ahead of the current one a sample may be matched to
+SWITCH_MM = 0.2         # a later command must be this much nearer to take over (a path crossing itself
+                        # near the current command does not pull the samples forward)
+
+
+@dataclass
+class CommandSpeed:
+    """How fast the TCP went along one command, from the samples matched to it."""
+    index: int                          # into plan.cmds
+    samples: int
+    t0: float                           # s since the start of the recording: first sample...
+    t1: float                           # ...and last sample on this command
+    entry: float                        # mm/s: speed of the first sample
+    low: float
+    mean: float
+    high: float
+    exit: float                         # speed of the last sample
+    length: float                       # mm, planned path of the command
+    on_speed: Optional[float]           # % of the samples within the band round the reference
+
+    @property
+    def seconds(self) -> float:
+        return self.t1 - self.t0
+
+
+def _segments(path):
+    """A planned path (N, 3) as segment starts, directions and squared lengths, for distance queries."""
+    p = np.asarray(path, dtype=float)
+    a, d = p[:-1], p[1:] - p[:-1]
+    dd = (d * d).sum(axis=1)
+    dd[dd == 0.0] = 1e-12
+    return a, d, dd
+
+
+def _distance(point, seg) -> float:
+    a, d, dd = seg
+    t = np.clip(((point - a) * d).sum(axis=1) / dd, 0.0, 1.0)
+    return float(np.sqrt((((a + d * t[:, None]) - point) ** 2).sum(axis=1)).min())
+
+
+def command_speeds(rec: SpeedRecorder, plan, reference: Optional[float] = None, tolerance: float = 10.0):
+    """The speed along every feed command (MoveL / MoveC / Circle) of a plan placed on the robot.
+    Returns ({command index: CommandSpeed}, owner) where owner[j] is the command index sample j was
+    matched to, or None (standing still, a rapid, or off the planned path)."""
+    n = len(rec)
+    owner: List[Optional[int]] = [None] * n
+    feed = [k for k in plan.motions if plan.cmds[k].instr != "MoveJ" and len(plan.paths[k]) > 1]
+    if not feed or not n:
+        return {}, owner
+    geo = [_segments(plan.paths[k]) for k in feed]
+    tol = MATCH_MM + max(0.0, float(getattr(plan.settings, "blend", 0.0) or 0.0))
+    phases = rec.phases()
+    m = 0                                                   # the command the arm is on (index into feed)
+    for j in range(n):
+        if rec.v[j] < MOVING_MM_S or phases[j] == RAPID:
+            continue
+        point = np.asarray(rec.xyz[j], dtype=float)
+        here = _distance(point, geo[m])
+        best, best_i = here, m
+        for i in range(m + 1, min(len(feed), m + LOOK_AHEAD + 1)):
+            d = _distance(point, geo[i])
+            if d < best - (SWITCH_MM if best_i == m else 0.0):
+                best, best_i = d, i
+        if best > tol:
+            continue                                        # not on the planned path
+        m = best_i
+        owner[j] = feed[m]
+
+    out: Dict[int, CommandSpeed] = {}
+    by_cmd: Dict[int, List[int]] = {}
+    for j, k in enumerate(owner):
+        if k is not None:
+            by_cmd.setdefault(k, []).append(j)
+    for k, js in by_cmd.items():
+        v = [rec.v[j] for j in js]
+        path = np.asarray(plan.paths[k], dtype=float)
+        on = (100.0 * sum(abs(x - reference) <= reference * tolerance / 100.0 for x in v) / len(v)
+              if reference else None)
+        out[k] = CommandSpeed(k, len(js), rec.t[js[0]], rec.t[js[-1]], v[0], min(v), sum(v) / len(v), max(v),
+                              v[-1], float(np.linalg.norm(np.diff(path, axis=0), axis=1).sum()), on)
+    return out, owner
+
+
+def write_command_csv(path: str, plan, speeds: Dict[int, CommandSpeed]):
+    """One row per motion command: what was sent, and how fast the TCP really went along it."""
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["#", "G-code line", "G-code", "Robot command", "Commanded", "Length (mm)", "Start (s)",
+                    "Duration (s)", "Samples", "Entry (mm/s)", "Min (mm/s)", "Mean (mm/s)", "Max (mm/s)",
+                    "Exit (mm/s)", "On speed (%)"])
+        for k in plan.motions:
+            c, s = plan.cmds[k], speeds.get(k)
+            row = [k + 1, c.line, c.src, c.instr, eng.speed_text(c, plan.settings)]
+            if s is None:
+                row += [""] * 10
+            else:
+                row += [f"{s.length:.2f}", f"{s.t0:.3f}", f"{s.seconds:.3f}", s.samples, f"{s.entry:.2f}",
+                        f"{s.low:.2f}", f"{s.mean:.2f}", f"{s.high:.2f}", f"{s.exit:.2f}",
+                        "" if s.on_speed is None else f"{s.on_speed:.0f}"]
+            w.writerow(row)
+
+
+def write_samples_csv(path: str, rec: SpeedRecorder, owner: Sequence[Optional[int]], plan=None):
+    """Every recorded sample: time, TCP position, speed, rapid or feed, and the command it was matched to."""
+    phases = rec.phases()
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["t (s)", "x (mm)", "y (mm)", "z (mm)", "speed (mm/s)", "phase", "#", "Robot command"])
+        for j in range(len(rec)):
+            k = owner[j] if j < len(owner) else None
+            instr = plan.cmds[k].instr if (plan is not None and k is not None) else ""
+            x, y, z = rec.xyz[j]
+            w.writerow([f"{rec.t[j]:.3f}", f"{x:.3f}", f"{y:.3f}", f"{z:.3f}", f"{rec.v[j]:.2f}", phases[j],
+                        "" if k is None else k + 1, instr])

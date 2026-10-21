@@ -9,21 +9,26 @@ it should hold. Numbers beside the graph on a wide window, above it on a narrow 
     numbers     now, reference, mean +/- standard deviation, steadiness (std as % of the mean), share
                 of the moving time inside the band, min / max, how often it left the band, and one line
                 about the targets
-    controls    reference (automatic = median while moving, or typed in), tolerance, clear
+    controls    reference (automatic = the commanded TCP speed in mm/s mode, else the median while moving,
+                or typed in), tolerance, clear, export CSV
+    per command after a run, the speed along every command (speed_monitor.command_speeds); selecting a
+                row of the command table shades that command's time on the graph (highlight())
 
 The numbers come from speed_monitor.py. Nothing here talks to the robot.
 """
 from __future__ import annotations
 
+import os
 import time
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.backends.qt_compat import QtCore, QtWidgets
 from matplotlib.figure import Figure
 
-from .speed_monitor import RAPID, SpeedRecorder, SpeedStats, TargetSpeed, plan_targets, target_summary
+from .speed_monitor import (RAPID, CommandSpeed, SpeedRecorder, SpeedStats, TargetSpeed, command_speeds,
+                            plan_targets, target_summary, write_command_csv, write_samples_csv)
 
 Signal = getattr(QtCore, "Signal", None) or QtCore.pyqtSignal
 Qt = QtCore.Qt
@@ -34,13 +39,17 @@ MAX_DRAWN = 6000                 # points drawn at most (the statistics always u
 
 class SpeedView(QtWidgets.QWidget):
     targets_changed = Signal(object)        # {command index: TargetSpeed} after analyse(), {} after clear()
+    commands_changed = Signal(object)       # {command index: CommandSpeed} after analyse(), {} after clear()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.recorder = SpeedRecorder()
         self.targets: Dict[int, TargetSpeed] = {}
+        self.commands: Dict[int, CommandSpeed] = {}
+        self._owner: List[Optional[int]] = []           # command of every sample (after analyse())
         self._plan = None
         self._dirty = True
+        self._span = None                               # the shaded time of the selected command
 
         # ---- numbers
         self.values: Dict[str, QtWidgets.QLabel] = {}
@@ -105,7 +114,8 @@ class SpeedView(QtWidgets.QWidget):
         self.reference.setSuffix(" mm/s")
         self.reference.setSpecialValueText("auto")
         self.reference.setMinimumWidth(110)
-        self.reference.setToolTip("The speed the TCP should hold. Auto: the median of the speeds while moving.")
+        self.reference.setToolTip("The speed the TCP should hold. Auto: the commanded TCP speed when the job runs "
+                                  "in mm/s,\nelse the median of the speeds while moving.")
         self.tolerance = QtWidgets.QDoubleSpinBox()
         self.tolerance.setRange(1.0, 50.0)
         self.tolerance.setDecimals(0)
@@ -117,6 +127,9 @@ class SpeedView(QtWidgets.QWidget):
         self.reference.valueChanged.connect(self._settings_changed)
         self.tolerance.valueChanged.connect(self._settings_changed)
         self.clear_btn.clicked.connect(self.clear)
+        self.export_btn = QtWidgets.QPushButton("Export CSV…")
+        self.export_btn.setToolTip("Save the speed of every command, and every recorded sample, as CSV files.")
+        self.export_btn.clicked.connect(self.export_dialog)
         # one row above the graph, two short rows beside it (_arrange)
         self._ref_label, self._band_label = QtWidgets.QLabel("Reference"), QtWidgets.QLabel("Band")
         self._controls = controls = QtWidgets.QGridLayout()
@@ -176,17 +189,82 @@ class SpeedView(QtWidgets.QWidget):
     def clear(self):
         self.recorder.clear()
         self._set_targets({}, None)
+        self._set_commands({}, [])
         self._dirty = True
         self.refresh()
+
+    def set_commanded(self, speed: Optional[float]):
+        """The TCP speed the job commands (mm/s mode), or None (% mode): "auto" compares with it."""
+        self.recorder.commanded = speed or None
+        self._dirty = True
 
     def custom_reference(self) -> Optional[float]:
         return self.reference.value() or None
 
     def analyse(self, plan):
-        """Work out the speed through every target of `plan` (placed on the robot) from what was recorded."""
+        """Work out the speed through every target and along every command of `plan` (placed on the robot)
+        from what was recorded."""
         self._set_targets(self._targets_for(plan), plan)
+        self._set_commands(*self._commands_for(plan))
         self._dirty = True
         self.refresh()
+
+    def _commands_for(self, plan):
+        if plan is None or not len(self.recorder):
+            return {}, []
+        ref, _auto = self.recorder.reference(self.custom_reference())
+        return command_speeds(self.recorder, plan, ref, self.tolerance.value())
+
+    def _set_commands(self, found: Dict[int, CommandSpeed], owner):
+        self.commands, self._owner = found, list(owner)
+        self.highlight(None)
+        self.commands_changed.emit(found)
+
+    def highlight(self, index: Optional[int]):
+        """Shade the time the arm spent on command `index` (None: no shading)."""
+        if self._span is not None:
+            self._span.remove()
+            self._span = None
+        c = self.commands.get(index) if index is not None else None
+        if c is not None:
+            # at least one sample period wide, so a command with a single sample still shows
+            half = 0.5 * max(c.seconds, 0.05)
+            middle = 0.5 * (c.t0 + c.t1)
+            self._span = self.ax.axvspan(middle - half, middle + half, color=ORANGE, alpha=0.18, lw=0)
+        self.canvas.draw_idle()
+
+    # ---- export
+    def export_dialog(self):
+        if not len(self.recorder):
+            QtWidgets.QMessageBox.information(self, "Export speeds", "Nothing recorded yet.")
+            return
+        stem = os.path.splitext(self._plan.path)[0] if self._plan is not None else "speed"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export speeds as CSV", stem + "_speed.csv",
+                                                        "CSV (*.csv)")
+        if not path:
+            return
+        try:
+            written = self.export(path)
+        except OSError as exc:
+            QtWidgets.QMessageBox.critical(self, "Export failed", str(exc))
+            return
+        QtWidgets.QMessageBox.information(self, "Export speeds", "Saved:\n" + "\n".join(written))
+
+    def export(self, path: str) -> List[str]:
+        """Write the speed per command to `path` (after a run) and every sample to <path>_samples.csv."""
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+        samples = path[:-4] + "_samples.csv"
+        written = []
+        if self._plan is not None:
+            write_command_csv(path, self._plan, self.commands)
+            written.append(path)
+        else:
+            samples = path
+        owner = self._owner if len(self._owner) == len(self.recorder) else [None] * len(self.recorder)
+        write_samples_csv(samples, self.recorder, owner, self._plan)
+        written.append(samples)
+        return written
 
     def _targets_for(self, plan) -> Dict[int, TargetSpeed]:
         if plan is None or not len(self.recorder):
@@ -205,6 +283,7 @@ class SpeedView(QtWidgets.QWidget):
     def _settings_changed(self, _value=None):
         if self._plan is not None:
             self._set_targets(self._targets_for(self._plan), self._plan)
+            self._set_commands(*self._commands_for(self._plan))
         self._dirty = True
         self.refresh()
 
@@ -229,7 +308,8 @@ class SpeedView(QtWidgets.QWidget):
 
         v = self.values
         v["now"].setText(mm_s(s.now))
-        v["ref"].setText("-" if s.reference is None else f"{s.reference:.1f} mm/s" + (" (auto)" if s.auto else ""))
+        v["ref"].setText("-" if s.reference is None else f"{s.reference:.1f} mm/s"
+                         + {"median": " (median)", "commanded": " (commanded)"}.get(s.source, ""))
         v["mean"].setText("-" if s.mean is None else f"{s.mean:.1f} ± {s.std:.1f} mm/s")
         v["cv"].setText("-" if s.cv is None else f"{s.cv:.1f} %")
         v["range"].setText("-" if s.low is None else f"{s.low:.1f} / {s.high:.1f}")
@@ -293,19 +373,22 @@ class SpeedView(QtWidgets.QWidget):
             self._grid.addWidget(head, 2 * row, col)
             self._grid.addWidget(value, 2 * row + 1, col)
         c = self._controls
-        for w in (self._ref_label, self.reference, self._band_label, self.tolerance, self.clear_btn):
+        for w in (self._ref_label, self.reference, self._band_label, self.tolerance, self.clear_btn,
+                  self.export_btn):
             c.removeWidget(w)
-        if wide:                                 # Reference [ ]  /  Band [ ] Clear
+        if wide:                                 # Reference [ ]  /  Band [ ] Clear  /  Export CSV
             c.addWidget(self._ref_label, 0, 0)
             c.addWidget(self.reference, 0, 1, 1, 2)
             c.addWidget(self._band_label, 1, 0)
             c.addWidget(self.tolerance, 1, 1)
             c.addWidget(self.clear_btn, 1, 2)
-        else:                                    # Reference [ ]  Band [ ]       Clear
+            c.addWidget(self.export_btn, 2, 1, 1, 2)
+        else:                                    # Reference [ ]  Band [ ]       Clear  Export CSV
             for col, w in enumerate((self._ref_label, self.reference, self._band_label, self.tolerance)):
                 c.addWidget(w, 0, col)
             c.addWidget(self.clear_btn, 0, 5)
-        for col in range(6):
+            c.addWidget(self.export_btn, 0, 6)
+        for col in range(7):
             c.setColumnStretch(col, 1 if (col == 4 and not wide) else 0)
         self._body.setDirection(QtWidgets.QBoxLayout.Direction.LeftToRight if wide
                                 else QtWidgets.QBoxLayout.Direction.TopToBottom)

@@ -71,7 +71,7 @@ from .plan_model import Plan, build_plan, default_settings  # noqa: E402
 from .robot_monitor import DEFAULT_IP, TCP, RobotMonitor, Target  # noqa: E402
 from .robot_widgets import ConnectDialog, RobotStatusPanel, _settings  # noqa: E402
 from .run_control import AUTO, HERE, MANUAL, Job, JobResult, RobotSession, RunSetup, RunSetupDialog  # noqa: E402
-from .speed_monitor import TargetSpeed  # noqa: E402
+from .speed_monitor import CommandSpeed, TargetSpeed  # noqa: E402
 from .speed_view import SpeedView  # noqa: E402
 
 Qt = QtCore.Qt
@@ -359,20 +359,41 @@ class PlanCanvas(FigureCanvasQTAgg):
 # ============================================================================ command list
 class CommandTable(QtCore.QAbstractTableModel):
     """One row per command of the plan: what the G-code said and what the robot will be told."""
-    HEAD = ["#", "Line", "G-code", "Robot command", "Speed", "At target"]
-    SPEED_COL, TARGET_COL = 4, 5
+    HEAD = ["#", "Line", "G-code", "Robot command", "Speed", "In move", "At target"]
+    HEAD_TIPS = {5: "Measured after a run: min / mean / max TCP speed (mm/s) along the command.\n"
+                    "Red: the mean is outside the band round the reference. Select a row to see its stretch "
+                    "of the speed graph.",
+                 6: "Measured after a run: TCP speed (mm/s) through the command's end point."}
+    SPEED_COL, MOVE_COL, TARGET_COL = 4, 5, 6
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._plan: Optional[Plan] = None
         self._targets: Dict[int, TargetSpeed] = {}     # measured after a run (speed_view.SpeedView)
+        self._commands: Dict[int, CommandSpeed] = {}   # measured after a run: the speed along each command
+        self._reference: Optional[float] = None
         self._tolerance = 10.0
 
     def set_plan(self, plan: Optional[Plan]):
         self.beginResetModel()
         self._plan = plan
-        self._targets = {}
+        self._targets, self._commands = {}, {}
         self.endResetModel()
+
+    def set_commands(self, commands: Dict[int, CommandSpeed], reference: Optional[float], tolerance: float):
+        """Show how fast the TCP went along each command (empty: clear the column)."""
+        self._commands, self._reference, self._tolerance = dict(commands), reference, tolerance
+        if self._plan is not None and self._plan.cmds:
+            self.dataChanged.emit(self.index(0, self.MOVE_COL), self.index(len(self._plan.cmds) - 1, self.MOVE_COL))
+
+    def move_text(self, row: int) -> Optional[str]:
+        s = self._commands.get(row)
+        return None if s is None else f"{s.low:.1f} / {s.mean:.1f} / {s.high:.1f}"
+
+    def _off_speed(self, row: int) -> bool:
+        """The mean speed along this command is outside the band round the reference."""
+        s = self._commands.get(row)
+        return bool(s and self._reference and abs(s.mean - self._reference) > self._reference * self._tolerance / 100)
 
     def set_targets(self, targets: Dict[int, TargetSpeed], tolerance: float):
         """Show how fast the TCP went through each target (empty: clear the column)."""
@@ -397,6 +418,8 @@ class CommandTable(QtCore.QAbstractTableModel):
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
         if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
             return self.HEAD[section]
+        if role == Qt.ItemDataRole.ToolTipRole and orientation == Qt.Orientation.Horizontal:
+            return self.HEAD_TIPS.get(section)
         return None
 
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
@@ -414,7 +437,9 @@ class CommandTable(QtCore.QAbstractTableModel):
             if col == 3:
                 return c.instr if motion else self.describe(index.row()).split(" -> ", 1)[1]
             if motion and col == self.SPEED_COL:
-                return f"{self._plan.settings.global_speed} %"
+                return eng.speed_text(c, self._plan.settings)
+            if col == self.MOVE_COL:
+                return self.move_text(index.row())
             if col == self.TARGET_COL:
                 return self.target_text(index.row())
             return None
@@ -429,7 +454,18 @@ class CommandTable(QtCore.QAbstractTableModel):
             if t.deviation is not None and abs(t.deviation) > self._tolerance:
                 return QtGui.QBrush(QtGui.QColor("#d62728"))
             return None
+        if role == Qt.ItemDataRole.ForegroundRole and col == self.MOVE_COL and self._off_speed(index.row()):
+            return QtGui.QBrush(QtGui.QColor("#d62728"))
         if role == Qt.ItemDataRole.ToolTipRole:
+            if col == self.MOVE_COL and index.row() in self._commands:
+                s = self._commands[index.row()]
+                return (f"TCP speed along this command ({s.samples} samples, {s.seconds:.2f} s, "
+                        f"{s.length:.1f} mm planned):\n"
+                        f"  in {s.entry:.1f}, min {s.low:.1f}, mean {s.mean:.1f}, max {s.high:.1f}, "
+                        f"out {s.exit:.1f} mm/s"
+                        + ("" if s.on_speed is None else
+                           f"\n  {s.on_speed:.0f} % of the samples within ±{self._tolerance:g} % of "
+                           f"{self._reference:.1f} mm/s"))
             if col == self.TARGET_COL and index.row() in self._targets:
                 t = self._targets[index.row()]
                 if t.stop:
@@ -509,6 +545,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.speed = SpeedView()
         self.speed.targets_changed.connect(
             lambda found: self.table_model.set_targets(found, self.speed.tolerance.value()))
+        self.speed.commands_changed.connect(self._on_command_speeds)
         self.tabs = QtWidgets.QTabWidget()
         self.tabs.addTab(self.summary, "Summary")
         self.tabs.addTab(self.log, "Log")
@@ -747,6 +784,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.canvas.clear_trail()
         self.speed.clear()                         # the speed graph starts with the run
+        a = self.checked.settings                  # in mm/s mode "auto" compares with the commanded speed
+        self.speed.set_commanded(a.tcp_speed if eng.physical(a) else None)
         self._launch(Job(self.session, self.checked.path, self.checked.settings, "run", expect=self.checked,
                          parent=self))
         self._say("busy", "Running - press Stop to stop the robot.")
@@ -944,9 +983,19 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_row(self, current, _previous):
         if self.plan is None or not current.isValid():
             self.canvas.highlight(None)
+            self.speed.highlight(None)
             return
         self.detail.setText(self.table_model.describe(current.row()))
         self.canvas.highlight(current.row() if current.row() in self.plan.paths else None)
+        self.speed.highlight(current.row())       # after a run: the command's stretch of the speed graph
+
+    def _on_command_speeds(self, found):
+        """The speed along every command was measured (after a run) or cleared."""
+        reference = self.speed.recorder.reference(self.speed.custom_reference())[0] if found else None
+        self.table_model.set_commands(found, reference, self.speed.tolerance.value())
+        if found:
+            for col in (CommandTable.MOVE_COL, CommandTable.TARGET_COL):
+                self.table.resizeColumnToContents(col)
 
     # ---- drag and drop
     def dragEnterEvent(self, event):

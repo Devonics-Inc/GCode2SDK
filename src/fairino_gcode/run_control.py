@@ -53,6 +53,10 @@ class RunSetup:
     yaw: float = 0.0                        # the drawing turned about Z by this much (deg)
     turn_with_path: bool = False            # False: the tool keeps one posture. True: as the WebApp does
     tool_down: bool = False                 # use "straight down" instead of the posture the tool has
+    speed_mode: str = "percent"             # "percent": every move at global_speed %; "physical": see below
+    tcp_speed: float = 20.0                 # physical: MoveL / MoveC / Circle at this TCP speed, mm/s...
+    acc: float = 200.0                      # ...with this acceleration, mm/s^2 (MoveJ keeps global_speed %)
+    blend: float = 0.5                      # mm, blend radius between moves that run on into each other
 
     def apply(self, base: argparse.Namespace) -> argparse.Namespace:
         """The engine settings for this setup (a copy of `base` with the setup filled in)."""
@@ -68,6 +72,8 @@ class RunSetup:
         a.rpy = list(self.rpy)
         a.tool, a.user = (self.tool, self.user) if self.placement == MANUAL else (0, 0)
         a.global_speed = int(self.global_speed)
+        a.speed_mode, a.tcp_speed, a.acc = self.speed_mode, float(self.tcp_speed), float(self.acc)
+        a.blend = float(self.blend)
         a.approach, a.spindle_do = float(self.approach), int(self.spindle_do)
         a.quiet, a.dry_run = False, False
         return a
@@ -80,7 +86,9 @@ class RunSetup:
         turned = f", drawing turned {self.yaw:g}\u00b0" if self.yaw and self.placement != AUTO else ""
         posture = ("tool turns with the path" if self.turn_with_path else "fixed posture") \
             + (", straight down" if self.tool_down else "")
-        return f"{where}{turned}; {posture}; global speed {self.global_speed} %"
+        speed = (f"TCP speed {self.tcp_speed:g} mm/s (acc {self.acc:g} mm/s²), MoveJ {self.global_speed} %"
+                 if self.speed_mode == "physical" else f"global speed {self.global_speed} %")
+        return f"{where}{turned}; {posture}; {speed}; blend {self.blend:g} mm"
 
 
 class RunSetupDialog(QtWidgets.QDialog):
@@ -209,13 +217,36 @@ class RunSetupDialog(QtWidgets.QDialog):
         self.spindle_do.setValue(setup.spindle_do)
         self.spindle_do.setSpecialValueText("none")
 
+        # speed: one % for everything, or a TCP speed in mm/s for the feed moves
+        self.by_percent = QtWidgets.QRadioButton("% of the robot's full speed, for every move")
+        self.by_physical = QtWidgets.QRadioButton("Constant TCP speed in mm/s for MoveL / MoveC / Circle")
+        (self.by_physical if setup.speed_mode == "physical" else self.by_percent).setChecked(True)
+        self.tcp_speed = spin(setup.tcp_speed, 0.5, 1000.0, 5.0, 1, " mm/s")
+        self.acc = spin(setup.acc, 10.0, 10000.0, 50.0, 0, " mm/s²")
+        self.acc.setToolTip("Halved automatically if the controller refuses it (error 183).")
+        self.blend = spin(setup.blend, 0.0, 50.0, 0.5, 1, " mm")
+        self.blend.setToolTip("How far the path may round a corner between two moves so the arm need not stop "
+                              "there.\nLarger = steadier speed through corners, but the corner is cut more. "
+                              "Never more than\nabout half the shorter of the two moves.")
+        physical_box = QtWidgets.QWidget()
+        pform = QtWidgets.QFormLayout(physical_box)
+        pform.setContentsMargins(22, 0, 0, 0)
+        pform.addRow("TCP speed", self.tcp_speed)
+        pform.addRow("Acceleration", self.acc)
+        self.physical_box = physical_box
+
         run = QtWidgets.QGroupBox("How it runs")
         form = QtWidgets.QFormLayout(run)
-        form.addRow("Speed", self.global_speed)
-        hint = note("Every move runs at this % of the robot's full speed.\n"
+        form.addRow(self.by_percent)
+        form.addRow(self.by_physical)
+        form.addRow(physical_box)
+        form.addRow("Speed %", self.global_speed)
+        hint = note("% mode: every move runs at this % of the robot's full speed.\n"
+                    "mm/s mode: only the MoveJ (G0) do.\n"
                     "F and S in the G-code are ignored. Start low for a first run.")
         hint.setStyleSheet("color: #6b7280;")
         form.addRow("", hint)
+        form.addRow("Blend radius between moves", self.blend)
         form.addRow("Approach / retract height", self.approach)
         form.addRow("Output for M3 / M5 (DO)", self.spindle_do)
 
@@ -244,7 +275,8 @@ class RunSetupDialog(QtWidgets.QDialog):
         outer.addWidget(self.scroll, 1)
         outer.addWidget(self.message)
         outer.addWidget(buttons)
-        for button in (self.by_ref, self.by_here, self.by_auto, self.by_manual, self.auto_rotate):
+        for button in (self.by_ref, self.by_here, self.by_auto, self.by_manual, self.auto_rotate,
+                       self.by_percent, self.by_physical):
             button.toggled.connect(self._enable)
         self._enable()
         self._fit_to_screen(content, parent)
@@ -272,15 +304,20 @@ class RunSetupDialog(QtWidgets.QDialog):
         self.auto_rotate.setEnabled(self.by_auto.isChecked())
         self.yaw.setEnabled(not (self.by_auto.isChecked() and self.auto_rotate.isChecked()))
         self.manual_box.setEnabled(self.by_manual.isChecked())
+        self.physical_box.setEnabled(self.by_physical.isChecked())
 
     def setup(self) -> RunSetup:
         placement = (REF if self.by_ref.isChecked() else HERE if self.by_here.isChecked() else
                      AUTO if self.by_auto.isChecked() else MANUAL)
-        return RunSetup(placement, self.ref_point.text().strip(), [w.value() for w in self.origin],
-                        [w.value() for w in self.rpy], self.tool.value(), self.user.value(),
-                        self.global_speed.value(), self.approach.value(),
-                        self.spindle_do.value(), self.auto_range.value(), self.auto_rotate.isChecked(),
-                        self.yaw.value(), self.turn_posture.isChecked(), self.tool_down.isChecked())
+        return RunSetup(placement=placement, ref_point=self.ref_point.text().strip(),
+                        origin=[w.value() for w in self.origin], rpy=[w.value() for w in self.rpy],
+                        tool=self.tool.value(), user=self.user.value(), global_speed=self.global_speed.value(),
+                        approach=self.approach.value(), spindle_do=self.spindle_do.value(),
+                        auto_range=self.auto_range.value(), auto_rotate=self.auto_rotate.isChecked(),
+                        yaw=self.yaw.value(), turn_with_path=self.turn_posture.isChecked(),
+                        tool_down=self.tool_down.isChecked(),
+                        speed_mode="physical" if self.by_physical.isChecked() else "percent",
+                        tcp_speed=self.tcp_speed.value(), acc=self.acc.value(), blend=self.blend.value())
 
     def accept(self):
         if self.by_ref.isChecked() and not self.ref_point.text().strip():

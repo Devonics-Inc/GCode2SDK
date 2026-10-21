@@ -20,6 +20,8 @@ Anything else is reported as a warning and ignored.
 
 Speed: every move runs at one speed, --global-speed % of the robot's full speed (the controller's
 global speed, like the WebApp speed slider). F and S words in the file are ignored.
+With --speed-mode physical, MoveL / MoveC / Circle are sent at --tcp-speed mm/s with --acc mm/s^2
+instead (the SDK's physical-unit mode), so the TCP speed does not depend on the move; MoveJ keeps the %.
 
 How coordinates are mapped:
     WebApp mode (--ref-point NAME): G-code XYZ are coordinates in the workpiece frame of the saved
@@ -378,10 +380,26 @@ def plan(cmds, frame, a):
     return follow
 
 
+def physical(a) -> bool:
+    """True: Cartesian moves are sent at --tcp-speed mm/s and --acc mm/s^2 (velAccParamMode 1).
+    False: at the global speed % of the robot's full speed. (Settings saved by older versions: %.)"""
+    return getattr(a, "speed_mode", "percent") == "physical"
+
+
 def speed_mm_s(c, a):
-    """Estimated TCP speed of a motion, for time estimates and previews only. Every move runs at the
-    global speed % of the robot's full speed (--max-speed = its TCP speed at 100 %); F and S are ignored."""
+    """TCP speed of a motion. In mm/s mode: the commanded speed of every MoveL / MoveC / Circle. Otherwise an
+    estimate, for time estimates and previews only: the global speed % of the robot's full speed (--max-speed
+    = its TCP speed at 100 %). F and S in the file are ignored either way."""
+    if physical(a) and c is not None and c.instr != "MoveJ":
+        return max(0.1, float(a.tcp_speed))
     return max(0.1, a.max_speed * a.global_speed / 100.0)
+
+
+def speed_text(c, a) -> str:
+    """How fast a motion is sent: "20 mm/s" (mm/s mode, Cartesian moves) or "20 %"."""
+    if physical(a) and c.instr != "MoveJ":
+        return f"{a.tcp_speed:g} mm/s"
+    return f"{a.global_speed} %"
 
 
 def describe(c, a, note=""):
@@ -400,7 +418,7 @@ def describe(c, a, note=""):
         return "[" + ", ".join(f"{round(v, 3) + 0.0:.3f}" for v in p) + "]"
 
     pts = fmt(c.poses[0]) if len(c.poses) == 1 else f"via {fmt(c.poses[0])} to {fmt(c.poses[1])}"
-    return head + f"{c.instr:<6} {pts} @ {a.global_speed} %{note}"
+    return head + f"{c.instr:<6} {pts} @ {speed_text(c, a)}{note}"
 
 
 def summarize(cmds, frame, a, follow, out=print):
@@ -427,7 +445,11 @@ def summarize(cmds, frame, a, follow, out=print):
     out("Posture         : " + (f"follows the path tangent (tool tilted {frame.tilt_deg():.1f} deg)"
                                 if follow else f"fixed {[round(v, 3) for v in frame.rpy]}"))
     out("Instructions    : " + ", ".join(f"{k} x{v}" for k, v in sorted(count.items())))
-    out(f"Speed           : {a.global_speed} % of full speed for every move (F / S in the file are ignored)")
+    if physical(a):
+        out(f"Speed           : MoveL / MoveC / Circle at {a.tcp_speed:g} mm/s (acceleration {a.acc:g} mm/s^2), "
+            f"MoveJ at {a.global_speed} % (F / S in the file are ignored)")
+    else:
+        out(f"Speed           : {a.global_speed} % of full speed for every move (F / S in the file are ignored)")
     out(f"Path length     : {length:.1f} mm   (est. {seconds / 60:.1f} min)")
     out(f"Frame bbox      : X {lo[0]:.1f}..{hi[0]:.1f}  Y {lo[1]:.1f}..{hi[1]:.1f}  Z {lo[2]:.1f}..{hi[2]:.1f} mm")
     return lo, hi
@@ -470,8 +492,8 @@ ERROR_TEXT = {
     151: "the joint configuration changes between the current and the target position",
     153: "arc points are too close together", 170: "the workpiece frame is not applied",
     171: "a joint is beyond its soft limit", 172: "the speed cannot be 0",
-    ERR_SPEED_LIMIT: "the speed is above the controller's limit - lower --global-speed",
-    ERR_ACC_LIMIT: "the acceleration is above the controller's limit - lower --global-speed",
+    ERR_SPEED_LIMIT: "the speed is above the controller's limit - lower --tcp-speed (mm/s mode) or --global-speed",
+    ERR_ACC_LIMIT: "the acceleration is above the controller's limit - lower --acc (mm/s mode) or --global-speed",
     185: "a fault signal stopped the motion (a MoveC / Circle with points under 1.0 mm apart gets this too)",
     186: "the emergency stop stopped the motion",
     204: "the controller's command queue is full",
@@ -622,10 +644,13 @@ class Streamer:
         elif self.sent % 200 == 1:
             print(f"  sent {self.sent}/{self.total} (G-code line {c.line})")
 
-    @staticmethod
-    def speed():
-        """Every Cartesian move at 100 % in percent mode: the global speed set in prepare() is then
-        the one speed of the whole job (F / S in the file are ignored)."""
+    def speed(self):
+        """The speed arguments of every MoveL / MoveC / Circle (F / S in the file are ignored).
+        % mode: 100 %, so the global speed set in prepare() is the one speed of the whole job.
+        mm/s mode (velAccParamMode 1): ovl is the TCP speed in mm/s and oacc the acceleration in mm/s^2;
+        the controller's global % does not scale them, so the speed is the same whatever it is set to."""
+        if physical(self.a):
+            return dict(vel=100.0, ovl=float(self.a.tcp_speed), oacc=float(self.a.acc), velAccParamMode=1)
         return dict(vel=100.0, ovl=100.0, oacc=100.0, velAccParamMode=0)
 
     def throttle(self):
@@ -684,8 +709,15 @@ class Streamer:
         self.last_pose = pose
 
     def cartesian(self, c, send):
-        """Send a MoveL / MoveC / Circle through send(speed settings)."""
-        return send(self.speed())
+        """Send a MoveL / MoveC / Circle through send(speed settings). In mm/s mode the controller refuses an
+        acceleration above its limit (error 183; the limit is not documented and differs between robots):
+        then halve --acc and send the same move again, and keep the lower value for the rest of the job."""
+        while True:
+            ret = send(self.speed())
+            if unpack(ret)[0] != ERR_ACC_LIMIT or not physical(self.a) or self.a.acc <= self.a.min_acc:
+                return ret
+            self.a.acc = max(self.a.acc / 2.0, self.a.min_acc)
+            self.log(f"  the controller refused the acceleration; continuing with {self.a.acc:g} mm/s^2")
 
     def move_line(self, c, blend):
         pose = c.poses[0]
@@ -925,7 +957,17 @@ def build_parser():
     p.add_argument("--arc-tol", type=float, default=ARC_TOL, metavar="MM",
                    help="max distance between those MoveL segments and the real arc")
     p.add_argument("--global-speed", type=int, default=20,
-                   help="speed of every move, %% of the robot's full speed (F / S in the file are ignored)")
+                   help="speed of every move, %% of the robot's full speed (F / S in the file are ignored); "
+                        "with --speed-mode physical only of the MoveJ")
+    p.add_argument("--speed-mode", choices=["percent", "physical"], default="percent",
+                   help="percent: every move at --global-speed %%; physical: MoveL / MoveC / Circle at "
+                        "--tcp-speed mm/s and --acc mm/s^2 (velAccParamMode 1), for a steady TCP speed")
+    p.add_argument("--tcp-speed", type=float, default=20.0, metavar="MM/S",
+                   help="TCP speed of MoveL / MoveC / Circle with --speed-mode physical")
+    p.add_argument("--acc", type=float, default=200.0, metavar="MM/S2",
+                   help="TCP acceleration with --speed-mode physical; halved automatically if the controller "
+                        "refuses it (error 183)")
+    p.add_argument("--min-acc", type=float, default=10.0, help=argparse.SUPPRESS)   # ...but never below this
     p.add_argument("--max-speed", type=float, default=250.0,
                    help="the robot's TCP speed in mm/s at 100 %%; only used to estimate the run time")
     p.add_argument("--blend", type=float, default=0.5, help="blend radius mm between moves")
@@ -958,6 +1000,8 @@ def main():
     a = p.parse_args()
     if a.ref_point and a.origin_here:
         p.error("--ref-point and --origin-here cannot be combined")
+    if a.tcp_speed <= 0 or a.acc <= 0:
+        p.error("--tcp-speed and --acc must be above 0")
 
     with open(a.file, "r", errors="replace") as f:
         cmds, warnings = parse_gcode(f.read(), a.feed, a.dwell_ms, a.arc_split)
