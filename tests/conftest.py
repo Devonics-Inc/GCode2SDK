@@ -1,5 +1,6 @@
 """Shared test fixtures. The GUI runs without a screen (Qt "offscreen") and talks to
 fake_cnde_robot.py on a free local UDP port instead of a real controller."""
+import gc
 import os
 import socket
 import sys
@@ -25,6 +26,16 @@ def qapp():
     QtCore.QSettings.setPath(QtCore.QSettings.Format.IniFormat,               # user's saved settings
                              QtCore.QSettings.Scope.UserScope, os.path.join(ROOT, ".pytest_cache", "qsettings"))
     return app
+
+
+@pytest.fixture(autouse=True)
+def collect_left_over_windows():
+    """Tests leave their windows to Python's garbage collector. Left to it, a window is deleted at a
+    random moment - possibly while another window is drawing - and that can crash the whole run
+    (seen as a segmentation fault). Collect them between tests instead. The application itself has
+    one window for the whole session, so this only concerns the tests."""
+    yield
+    gc.collect()
 
 
 def free_port() -> int:

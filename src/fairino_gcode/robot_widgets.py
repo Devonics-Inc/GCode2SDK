@@ -135,17 +135,17 @@ class RobotStatusPanel(QtWidgets.QGroupBox):
 
         self.link = QtWidgets.QLabel()
         self.link.setTextFormat(Qt.TextFormat.RichText)
+        self.link.setWordWrap(True)
 
         grid = QtWidgets.QGridLayout()
         grid.setHorizontalSpacing(10)
-        self.pose = []
-        for col, (name, unit) in enumerate([("X", "mm"), ("Y", "mm"), ("Z", "mm"),
-                                            ("RX", "\u00b0"), ("RY", "\u00b0"), ("RZ", "\u00b0")]):
-            head = QtWidgets.QLabel(f"{name} ({unit})")
+        self.pose = []                          # TCP position only: X, Y, Z
+        for col, name in enumerate("XYZ"):
+            head = QtWidgets.QLabel(f"{name} (mm)")
             head.setAlignment(Qt.AlignmentFlag.AlignRight)
             head.setStyleSheet(f"color: {GREY};")
             value = QtWidgets.QLabel("-")
-            value.setFont(big if col < 3 else mono)
+            value.setFont(big)
             value.setAlignment(Qt.AlignmentFlag.AlignRight)
             value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             grid.addWidget(head, 0, col)
@@ -162,6 +162,8 @@ class RobotStatusPanel(QtWidgets.QGroupBox):
         box.addLayout(grid)
         box.addWidget(self.state)
         box.addWidget(self.fault)
+        # as tall as its content and no taller: the space below goes to the summary and the table
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Maximum)
         self.set_disconnected()
 
     # ---- connection state

@@ -26,6 +26,7 @@ from . import fairino_CNDE_listener as cnde
 Signal = getattr(QtCore, "Signal", None) or QtCore.pyqtSignal
 
 TCP = "actual_TCP_pos"
+RECEIVED = "_received"            # added to every sample: time.monotonic() when the frame arrived
 
 # What to ask the controller for, best first. A controller refuses the whole configuration if it does
 # not know one of the names, so on a refusal the next, smaller set is tried.
@@ -152,6 +153,7 @@ class RobotMonitor(QtCore.QThread):
             except ValueError:
                 continue                           # damaged frame - the next one is 50 ms away
             last_frame = time.monotonic()
+            data[RECEIVED] = last_frame                # when it arrived: the speed graph's time axis
             if is_stale:
                 is_stale = False
                 self.stale.emit(False)

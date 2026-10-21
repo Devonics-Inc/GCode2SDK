@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import copy
 import threading
+import time
 import traceback
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
@@ -27,6 +28,7 @@ from matplotlib.backends.qt_compat import QtCore, QtGui, QtWidgets
 from . import auto_place
 from . import gcode_to_fairino as eng
 from .plan_model import Plan, build_plan
+from .speed_monitor import FEED, RAPID
 
 Signal = getattr(QtCore, "Signal", None) or QtCore.pyqtSignal
 Qt = QtCore.Qt
@@ -332,6 +334,8 @@ class JobResult:
 class Job(QtCore.QThread):
     log = Signal(str)
     command = Signal(int, str)              # index into plan.cmds (-1: approach / retract), trace line
+    phase = Signal(str, float)              # "feed" / "rapid" (G0 -> MoveJ) starts: time.monotonic() in
+                                            # this thread, at the moment the command is sent (speed graph)
     placed = Signal(object)                 # Plan, as soon as it is positioned (before the IK check)
     paused = Signal(str)                    # M0 / M1: waiting for continue()
     done = Signal(object)                   # JobResult
@@ -385,7 +389,7 @@ class Job(QtCore.QThread):
             streamer.log = self.log.emit
             streamer.pause = self._pause
             index = {id(c): k for k, c in enumerate(plan.cmds)}
-            streamer.on_command = lambda c, text: self.command.emit(index.get(id(c), -1), text)
+            streamer.on_command = lambda c, text: self._sent(index.get(id(c), -1), c, text)
             streamer.stoppable = True
 
             self.log.emit(f"Checking that the robot can reach all {len(plan.motions)} moves, "
@@ -421,6 +425,13 @@ class Job(QtCore.QThread):
                 result.message += f"  THE STOP COMMAND FAILED ({exc!r}) - USE THE EMERGENCY STOP."
         self.log.emit(result.message)
         self.done.emit(result)
+
+    def _sent(self, index: int, c, text: str):
+        """A command is about to go out. A MoveJ always runs on its own, from an idle arm until it is
+        idle again, so it starts a rapid and the next command sent ends it."""
+        if self.mode == "run":
+            self.phase.emit(RAPID if c.instr == "MoveJ" else FEED, time.monotonic())
+        self.command.emit(index, text)
 
     def _place_automatically(self, robot, a):
         """Fill in a.origin / a.rpy: height and posture from the tool as it is now, X and Y searched."""

@@ -69,8 +69,10 @@ from . import gcode_to_fairino as eng  # noqa: E402
 from .export_script import default_name, export_plan  # noqa: E402
 from .plan_model import Plan, build_plan, default_settings  # noqa: E402
 from .robot_monitor import DEFAULT_IP, TCP, RobotMonitor, Target  # noqa: E402
-from .robot_widgets import ConnectDialog, RobotStatusPanel  # noqa: E402
+from .robot_widgets import ConnectDialog, RobotStatusPanel, _settings  # noqa: E402
 from .run_control import AUTO, HERE, MANUAL, Job, JobResult, RobotSession, RunSetup, RunSetupDialog  # noqa: E402
+from .speed_monitor import TargetSpeed  # noqa: E402
+from .speed_view import SpeedView  # noqa: E402
 
 Qt = QtCore.Qt
 
@@ -119,6 +121,7 @@ class PlanCanvas(FigureCanvasQTAgg):
 
     # ---- drawing
     def _empty(self):
+        self._legend = None
         self.ax.clear()
         self._label_axes()
         self.ax.text2D(0.5, 0.96, "Open a G-code file to see the plan", transform=self.ax.transAxes,
@@ -171,14 +174,18 @@ class PlanCanvas(FigureCanvasQTAgg):
             where = f"workpiece {plan.settings.user}" if plan.settings.user else "base"
             note, colour = f"Placed on the robot: tool {plan.settings.tool}, {where} frame", "#1a9850"
         else:
-            note, colour = "Not placed on the robot yet - drawn at the G-code's own coordinates", "#8a8f98"
-        self.ax.text2D(0.5, 0.985, note, transform=self.ax.transAxes, ha="center", va="top",
+            note, colour = "Not placed on the robot yet\n(G-code coordinates)", "#8a8f98"
+        # note top right, legend top left - of the whole canvas, not of the (square, inset) 3D axes, so
+        # the two stay apart however narrow the view is
+        self.ax.text2D(0.99, 0.99, note, transform=self.fig.transFigure, ha="right", va="top",
                        fontsize=8.5, color=colour)
 
         handles, labels = self.ax.get_legend_handles_labels()
         handles.append(Line2D([], [], marker="o", ms=8, color=TCP_COLOUR, mec="white", ls="none"))
         labels.append("robot TCP (live)")
-        self.ax.legend(handles, labels, loc="upper left", fontsize=8, frameon=True, framealpha=0.9)
+        self._legend = self.ax.legend(handles, labels, loc="upper left", bbox_to_anchor=(0.005, 0.995),
+                                      bbox_transform=self.fig.transFigure, fontsize=8, frameon=True, framealpha=0.9)
+        self._fit_legend()
         self._add_live_artists()
         self.refit()
         if keep_view:
@@ -186,6 +193,20 @@ class PlanCanvas(FigureCanvasQTAgg):
         else:
             self._look("Iso")
         self._redraw()
+
+    def _fit_legend(self):
+        """Smaller legend on a small view, none on a tiny one: it must not hide the drawing."""
+        legend = getattr(self, "_legend", None)
+        if legend is None:
+            return
+        side = min(self.width(), self.height())
+        legend.set_visible(side >= 280)
+        for text in legend.get_texts():
+            text.set_fontsize(8 if side >= 520 else 6.5)
+
+    def resizeEvent(self, event):
+        self._fit_legend()
+        super().resizeEvent(event)
 
     def _draw_origin(self, plan: Plan, pts):
         """Small X/Y/Z triad at G-code (0, 0, 0), so the orientation of the drawing is visible."""
@@ -338,16 +359,34 @@ class PlanCanvas(FigureCanvasQTAgg):
 # ============================================================================ command list
 class CommandTable(QtCore.QAbstractTableModel):
     """One row per command of the plan: what the G-code said and what the robot will be told."""
-    HEAD = ["#", "Line", "G-code", "Robot command", "Speed"]
+    HEAD = ["#", "Line", "G-code", "Robot command", "Speed", "At target"]
+    SPEED_COL, TARGET_COL = 4, 5
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._plan: Optional[Plan] = None
+        self._targets: Dict[int, TargetSpeed] = {}     # measured after a run (speed_view.SpeedView)
+        self._tolerance = 10.0
 
     def set_plan(self, plan: Optional[Plan]):
         self.beginResetModel()
         self._plan = plan
+        self._targets = {}
         self.endResetModel()
+
+    def set_targets(self, targets: Dict[int, TargetSpeed], tolerance: float):
+        """Show how fast the TCP went through each target (empty: clear the column)."""
+        self._targets, self._tolerance = dict(targets), tolerance
+        if self._plan is not None and self._plan.cmds:
+            self.dataChanged.emit(self.index(0, self.TARGET_COL), self.index(len(self._plan.cmds) - 1, self.TARGET_COL))
+
+    def target_text(self, row: int) -> Optional[str]:
+        t = self._targets.get(row)
+        if t is None:
+            return None
+        if t.stop:
+            return "stop"                          # the arm halts there on purpose: no speed to judge
+        return f"{t.speed:.1f} mm/s" + ("" if t.deviation is None else f"  {t.deviation:+.0f} %")
 
     def rowCount(self, parent=QtCore.QModelIndex()):
         return 0 if parent.isValid() or self._plan is None else len(self._plan.cmds)
@@ -374,14 +413,31 @@ class CommandTable(QtCore.QAbstractTableModel):
                 return c.src
             if col == 3:
                 return c.instr if motion else self.describe(index.row()).split(" -> ", 1)[1]
-            if motion and col == 7:
+            if motion and col == self.SPEED_COL:
                 return f"{self._plan.settings.global_speed} %"
+            if col == self.TARGET_COL:
+                return self.target_text(index.row())
             return None
         if role == Qt.ItemDataRole.TextAlignmentRole and col not in (2, 3):
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         if role == Qt.ItemDataRole.ForegroundRole and col == 3 and motion:
             return QtGui.QBrush(QtGui.QColor(STYLES[style_key(c)]["color"]))
+        if role == Qt.ItemDataRole.ForegroundRole and col == self.TARGET_COL and index.row() in self._targets:
+            t = self._targets[index.row()]
+            if t.stop:
+                return QtGui.QBrush(QtGui.QColor("#8a8f98"))
+            if t.deviation is not None and abs(t.deviation) > self._tolerance:
+                return QtGui.QBrush(QtGui.QColor("#d62728"))
+            return None
         if role == Qt.ItemDataRole.ToolTipRole:
+            if col == self.TARGET_COL and index.row() in self._targets:
+                t = self._targets[index.row()]
+                if t.stop:
+                    return ("The move ends exactly here (not blended): the arm stops on purpose.\n"
+                            f"The TCP came within {t.miss:.2f} mm of the point, {t.t:.2f} s into the recording.")
+                return (f"Lowest TCP speed close to this move's end point: {t.speed:.1f} mm/s"
+                        + ("" if t.deviation is None else f" ({t.deviation:+.1f} % against the reference)")
+                        + f"\nThe TCP came within {t.miss:.2f} mm of the point, {t.t:.2f} s into the recording.")
             return self.describe(index.row())
         return None
 
@@ -426,7 +482,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle(self.title)
         if os.path.exists(ICON_FILE):
             self.setWindowIcon(QtGui.QIcon(ICON_FILE))
-        self.resize(1360, 780)
         self.setAcceptDrops(True)
 
         self.canvas = PlanCanvas(self)
@@ -451,6 +506,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log.setFont(mono)
         self.log.setMaximumBlockCount(5000)
         self.log.setPlaceholderText("Checks and runs are logged here: every command as it is sent.")
+        self.speed = SpeedView()
+        self.speed.targets_changed.connect(
+            lambda found: self.table_model.set_targets(found, self.speed.tolerance.value()))
         self.tabs = QtWidgets.QTabWidget()
         self.tabs.addTab(self.summary, "Summary")
         self.tabs.addTab(self.log, "Log")
@@ -463,26 +521,46 @@ class MainWindow(QtWidgets.QMainWindow):
         self.detail.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.detail.setMargin(4)
 
-        self.robot_panel = RobotStatusPanel()
-        self.robot_panel.setFixedHeight(200)
+        self.robot_panel = RobotStatusPanel()         # as tall as its content, never stretched
 
-        right = QtWidgets.QSplitter(Qt.Orientation.Vertical)
-        right.addWidget(self.robot_panel)
-        right.addWidget(self.tabs)
+        # Everything below is sized in proportions, not pixels, so the window works on any screen:
+        # the splitters share out whatever space there is, and the user can drag them.
         lower = QtWidgets.QWidget()
         box = QtWidgets.QVBoxLayout(lower)
         box.setContentsMargins(0, 0, 0, 0)
         box.addWidget(self.table, 1)
         box.addWidget(self.detail)
-        right.addWidget(lower)
-        right.setStretchFactor(2, 1)
-        right.setSizes([220, 160, 380])
+        self.right_split = QtWidgets.QSplitter(Qt.Orientation.Vertical)
+        self.right_split.addWidget(self.tabs)
+        self.right_split.addWidget(lower)
+        self.right_split.setChildrenCollapsible(False)
+        self.right_split.setStretchFactor(0, 2)           # tabs : table = 2 : 3, also when resized
+        self.right_split.setStretchFactor(1, 3)
+        lower.setMinimumHeight(90)
+        self.tabs.setMinimumHeight(120)
+        right = QtWidgets.QWidget()
+        column_right = QtWidgets.QVBoxLayout(right)
+        column_right.setContentsMargins(0, 0, 0, 0)
+        column_right.addWidget(self.robot_panel)
+        column_right.addWidget(self.right_split, 1)
 
-        split = QtWidgets.QSplitter(Qt.Orientation.Horizontal)
-        split.addWidget(self.canvas)
+        # the speed graph under the 3D view: in sight during a run, with the width of the view.
+        # Drag the handle down to fold it away.
+        self.canvas.setMinimumSize(240, 150)
+        self.left_split = QtWidgets.QSplitter(Qt.Orientation.Vertical)
+        self.left_split.addWidget(self.canvas)
+        self.left_split.addWidget(self.speed)
+        self.left_split.setCollapsible(0, False)
+        self.left_split.setStretchFactor(0, 3)            # 3D view : speed = 3 : 2, also when resized
+        self.left_split.setStretchFactor(1, 2)
+        right.setMinimumWidth(300)
+        self.split = split = QtWidgets.QSplitter(Qt.Orientation.Horizontal)
+        split.addWidget(self.left_split)
         split.addWidget(right)
-        split.setStretchFactor(0, 1)
-        split.setSizes([750, 610])
+        split.setChildrenCollapsible(False)
+        split.setStretchFactor(0, 3)                      # 3D view : panels = 3 : 2, also when resized
+        split.setStretchFactor(1, 2)
+        self._proportioned = False                        # sizes are shared out once the window has a size
         centre = QtWidgets.QWidget()
         column = QtWidgets.QVBoxLayout(centre)
         column.setContentsMargins(0, 0, 0, 0)
@@ -525,6 +603,47 @@ class MainWindow(QtWidgets.QMainWindow):
         self._live_timer.start()
         self._say("info", "Open a G-code file, connect to the robot, then set up the run.")
         self._update_actions()
+        self._fit_to_screen()
+
+    # ---- size and layout: whatever the screen
+    def _fit_to_screen(self):
+        """Open at the size the window had last time on this computer, or else a large part of the
+        screen it is on - never bigger than that screen, whatever its resolution and scaling."""
+        geometry = _settings().value("window/geometry")
+        screen = self.screen() or QtGui.QGuiApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen is not None else QtCore.QRect(0, 0, 1360, 780)
+        if geometry is not None and self.restoreGeometry(geometry):
+            if self.width() > avail.width() or self.height() > avail.height():      # saved on a bigger screen
+                self.resize(min(self.width(), avail.width()), min(self.height(), avail.height()))
+            return
+        self.resize(min(1600, int(avail.width() * 0.9)), min(1000, int(avail.height() * 0.9)))
+        self.move(avail.center() - self.rect().center())
+        if avail.width() < 1200 or avail.height() < 720:                           # small screen: use all of it
+            self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._arrange()
+
+    def _arrange(self):
+        """Side by side on a wide window; the 3D view above the panels on a tall, narrow one."""
+        if not hasattr(self, "split"):
+            return
+        tall = self.width() < self.height() * 0.95
+        want = Qt.Orientation.Vertical if tall else Qt.Orientation.Horizontal
+        if self.split.orientation() != want or not self._proportioned:
+            self.split.setOrientation(want)
+            self._proportion(self.split, (1, 1) if tall else (3, 2))
+            self._proportion(self.right_split, (2, 3))
+            self._proportion(self.left_split, (3, 2))
+            self._proportioned = True
+
+    @staticmethod
+    def _proportion(splitter, ratio):
+        """Share the splitter's present length out in this ratio (setSizes takes pixels)."""
+        length = splitter.width() if splitter.orientation() == Qt.Orientation.Horizontal else splitter.height()
+        length = max(length, 100)
+        splitter.setSizes([int(length * r / sum(ratio)) for r in ratio])
 
     # ---- what can be pressed right now
     def _update_actions(self):
@@ -570,6 +689,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Take over a RobotMonitor that is already listening."""
         self.disconnect_robot()
         self.monitor = monitor
+        self.speed.clear()
         monitor.sample.connect(self._on_sample)
         monitor.stale.connect(self._on_stale)
         monitor.lost.connect(self._on_lost)
@@ -626,6 +746,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if confirm and not self._confirm_start():
             return
         self.canvas.clear_trail()
+        self.speed.clear()                         # the speed graph starts with the run
         self._launch(Job(self.session, self.checked.path, self.checked.settings, "run", expect=self.checked,
                          parent=self))
         self._say("busy", "Running - press Stop to stop the robot.")
@@ -688,6 +809,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.job = job
         job.log.connect(self.log.appendPlainText)
         job.command.connect(self._on_command)
+        job.phase.connect(self.speed.mark)          # rapids are left out of the speed numbers
         job.placed.connect(self._on_placed)
         job.paused.connect(self._on_paused)
         job.done.connect(self._on_job_done)
@@ -724,19 +846,27 @@ class MainWindow(QtWidgets.QMainWindow):
             self.checked = result.plan if result.ok else None
             self._say("good" if result.ok else "bad",
                       result.message + ("  Press Start to run it." if result.ok else ""))
-        elif result.ok:
-            self._say("good", "Run finished.")
-        elif result.stopped:
-            self._say("info", "Stopped by the operator. The robot is at rest; Start runs the plan from the beginning.")
         else:
-            self._say("bad", "Run ended with an error, the robot was stopped: " + result.message)
+            if result.ok:
+                self._say("good", "Run finished.")
+            elif result.stopped:
+                self._say("info", "Stopped by the operator. The robot is at rest; Start runs the plan from the "
+                                  "beginning.")
+            else:
+                self._say("bad", "Run ended with an error, the robot was stopped: " + result.message)
+            if self.checked is not None:
+                # give the last status frames (the arm's final stretch) a moment to arrive, then measure
+                # the speed through every target of the plan that was run
+                plan = self.checked
+                QtCore.QTimer.singleShot(400, lambda: self.speed.analyse(plan) if self.plan is plan else None)
         if result.stop_failed:
             QtWidgets.QMessageBox.critical(self, "Stop command failed", result.message)
         self._update_actions()
 
     def _on_sample(self, sample: dict):
         if self.monitor is not None:               # late frames after a disconnect are dropped
-            self._sample = sample
+            self._sample = sample                  # the 3D view and the panel show only the newest...
+            self.speed.add_sample(sample)          # ...the speed graph keeps every one
 
     def _show_live(self):
         self._show_running()
@@ -765,6 +895,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event):
         self.disconnect_robot()
+        _settings().setValue("window/geometry", self.saveGeometry())
         super().closeEvent(event)
 
     # ---- loading
