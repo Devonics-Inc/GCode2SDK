@@ -42,6 +42,7 @@ Examples:
     python gcode_to_fairino.py part.gcode --ref-point refPose --check-ik --export part_fairino.py
 """
 import argparse
+import inspect
 import math
 import re
 import sys
@@ -49,6 +50,8 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
+
+import numpy as np
 
 WORD_RE = re.compile(r"([A-Z])\s*([-+]?(?:\d+\.?\d*|\.\d+))")
 MOTION_KINDS = ("line", "arc", "circle")
@@ -381,9 +384,15 @@ def plan(cmds, frame, a):
 
 
 def physical(a) -> bool:
-    """True: Cartesian moves are sent at --tcp-speed mm/s and --acc mm/s^2 (velAccParamMode 1).
-    False: at the global speed % of the robot's full speed. (Settings saved by older versions: %.)"""
-    return getattr(a, "speed_mode", "percent") == "physical"
+    """True: Cartesian moves run at --tcp-speed mm/s and --acc mm/s^2 - sent with velAccParamMode 1, or
+    streamed point by point (servo). False: at the global speed % of the robot's full speed.
+    (Settings saved by older versions: %.)"""
+    return getattr(a, "speed_mode", "percent") in ("physical", "servo")
+
+
+def servo(a) -> bool:
+    """True: the G1 / G2 / G3 are streamed with ServoJ at a fixed TCP speed (servo_path.py)."""
+    return getattr(a, "speed_mode", "percent") == "servo"
 
 
 def speed_mm_s(c, a):
@@ -398,7 +407,7 @@ def speed_mm_s(c, a):
 def speed_text(c, a) -> str:
     """How fast a motion is sent: "20 mm/s" (mm/s mode, Cartesian moves) or "20 %"."""
     if physical(a) and c.instr != "MoveJ":
-        return f"{a.tcp_speed:g} mm/s"
+        return f"{a.tcp_speed:g} mm/s" + (" fixed" if servo(a) and not c.rapid else "")
     return f"{a.global_speed} %"
 
 
@@ -445,7 +454,18 @@ def summarize(cmds, frame, a, follow, out=print):
     out("Posture         : " + (f"follows the path tangent (tool tilted {frame.tilt_deg():.1f} deg)"
                                 if follow else f"fixed {[round(v, 3) for v in frame.rpy]}"))
     out("Instructions    : " + ", ".join(f"{k} x{v}" for k, v in sorted(count.items())))
-    if physical(a):
+    if servo(a):
+        out(f"Speed           : G1 / G2 / G3 streamed point by point (ServoJ every {1000 * a.servo_cycle:g} ms) at "
+            f"a fixed {a.tcp_speed:g} mm/s (acceleration {a.acc:g} mm/s^2), G0 at {a.global_speed} % "
+            "(F / S in the file are ignored)")
+        try:
+            from . import servo_path as sp
+        except ImportError:                      # run as a plain script, servo_path.py next to it
+            import servo_path as sp
+        groups = [sp.build_group(cmds, f, la, frame, a.tcp_speed, a.acc) for f, la in sp.feed_groups(cmds)]
+        for line in sp.describe_groups(groups, cmds, a.tcp_speed):
+            out(line)
+    elif physical(a):
         out(f"Speed           : MoveL / MoveC / Circle at {a.tcp_speed:g} mm/s (acceleration {a.acc:g} mm/s^2), "
             f"MoveJ at {a.global_speed} % (F / S in the file are ignored)")
     else:
@@ -596,6 +616,8 @@ class Streamer:
         # A blocking SDK call cannot be interrupted, so with it a stop request would have to wait for
         # the move to finish; this way it is noticed within milliseconds, between two short calls.
         self.stoppable = False
+        self.servo_groups = {}    # fixed-speed mode: first command index -> servo_path.ServoGroup
+        self.servo_used = False   # a ServoJ stream was started (emergency_stop also clears the queue)
 
     # ---- helpers
     def check_abort(self):
@@ -869,16 +891,26 @@ class Streamer:
         def feed_move(c):                     # Cartesian moves, which can blend into each other
             return c is not None and c.kind in MOTION_KINDS and c.instr != "MoveJ"
 
+        if servo(self.a):                         # every joint position of the fixed-speed paths, before moving
+            self.plan_servo(cmds, hop(first.poses[-1], first.line, "").poses[0] if lift > 0 else None)
         if lift > 0:
             self.send(hop(first.poses[-1], first.line, "(approach)"))
 
         t0 = time.time()
-        for idx, c in enumerate(cmds):
+        idx = 0
+        while idx < len(cmds):
+            c = cmds[idx]
+            group = self.servo_groups.get(idx)
+            if group is not None:                 # fixed-speed mode: these G1 / G2 / G3 are streamed
+                self.stream(cmds, group)
+                idx = group.last + 1
+                continue
             nxt = cmds[idx + 1] if idx + 1 < len(cmds) else None
             blend = -1.0
-            if feed_move(c) and feed_move(nxt):
+            if feed_move(c) and feed_move(nxt) and not servo(self.a):
                 blend = min(self.a.blend, blend_limit(c, nxt, self.frame.scale))
             self.send(c, blend)
+            idx += 1
 
         self.wait_idle()
         if self.spindle_on:
@@ -887,6 +919,201 @@ class Streamer:
         if lift > 0 and self.last_pose is not None:
             self.send(hop(self.last_pose, motions[-1].line, "(retract)"))
         self.log(f"Done in {time.time() - t0:.1f}s")
+
+    # ---- fixed-speed mode: ServoJ streaming (see servo_path.py)
+    def sdk_call(self, name, **kw):
+        """Call an SDK function with only the keyword arguments this SDK version knows (ServoJ gained
+        axisPos and cmdType over the versions)."""
+        fn = getattr(self.robot, name)
+        try:
+            params = inspect.signature(fn).parameters
+            if not any(p.kind == p.VAR_KEYWORD for p in params.values()):
+                kw = {k: v for k, v in kw.items() if k in params}
+        except (TypeError, ValueError):
+            pass
+        return fn(**kw)
+
+    def servo_transport(self) -> int:
+        """cmdType for ServoMoveStart / ServoJ / ServoMoveEnd: 1 = UDP (port 20007, no reply to wait for:
+        well under a millisecond per point), 0 = XML-RPC (a round trip per point)."""
+        want = getattr(self.a, "servo_transport", "auto")
+        try:
+            udp = "cmdType" in inspect.signature(self.robot.ServoJ).parameters
+        except (TypeError, ValueError, AttributeError):
+            udp = False
+        if want == "udp" and not udp:
+            raise SetupError("This FAIRINO SDK cannot send ServoJ over UDP (no cmdType): use --servo-transport xmlrpc "
+                             "or a newer SDK.")
+        return 1 if udp and want != "xmlrpc" else 0
+
+    def plan_servo(self, cmds, hop_pose=None):
+        """Plan every fixed-speed path and ask the controller for its joint positions - before anything moves,
+        so a path that cannot be streamed is refused at the start, not half-way."""
+        try:
+            from . import servo_path as sp
+        except ImportError:
+            import servo_path as sp
+        self.servo_groups = {}
+        self.last_j = self.current_joints()
+        last_rpy = None
+        if hop_pose is not None:
+            self.ik(hop_pose, cmds[0].line)
+            last_rpy = list(hop_pose[3:])
+        groups = dict(sp.feed_groups(cmds))
+        cycle = float(self.a.servo_cycle)
+        k = 0
+        while k < len(cmds):
+            self.check_abort()
+            c = cmds[k]
+            if k in groups:
+                g = sp.build_group(cmds, k, groups[k], self.frame, float(self.a.tcp_speed), float(self.a.acc), last_rpy)
+                where = f"lines {c.line}-{cmds[g.last].line}"
+                self.log(f"Fixed speed, {where}: {g.length:.1f} mm in {g.seconds:.1f} s - asking the controller for "
+                         f"{len(g.s)} joint positions …")
+                sp.solve_joints(g, lambda pose, own: self.ik(pose, cmds[own].line))
+                step, speed, i = sp.joint_check(g, cycle)
+                line = cmds[int(g.owner[min(i + 1, len(g.owner) - 1)])].line
+                if step > self.a.servo_max_step:
+                    raise RobotCommandError(
+                        f"Fixed speed, {where}: a joint would have to turn {step:.1f} deg between two points "
+                        f"{sp.KNOT_MM:g} mm apart near G-code line {line} - a singular position or a change of arm "
+                        "configuration. Move the drawing, or use another speed mode.")
+                if speed > self.a.servo_joint_speed:
+                    raise RobotCommandError(
+                        f"Fixed speed, {where}: a joint would have to turn at {speed:.0f} deg/s near G-code line "
+                        f"{line} (allowed {self.a.servo_joint_speed:g}). Lower the TCP speed, or move the drawing away "
+                        "from the singular position.")
+                self.servo_groups[k] = g
+                last_rpy = list(g.rpy[-1])
+                k = g.last + 1
+                continue
+            if c.kind in MOTION_KINDS:
+                for pose in c.poses:
+                    self.ik(pose, c.line)
+                last_rpy = list(c.poses[-1][3:])
+            k += 1
+        self.last_j = self.current_joints()
+
+    @staticmethod
+    def _wait_until(deadline):
+        """Sleep until time.perf_counter() reaches deadline: sleep most of it, spin the last ~1.5 ms."""
+        while True:
+            left = deadline - time.perf_counter()
+            if left <= 0:
+                return
+            if left > 0.002:
+                time.sleep(left - 0.0015)
+
+    def stream(self, cmds, g):
+        """Send one fixed-speed path: a ServoJ every servo cycle, on time, from the start of the path to its end."""
+        try:
+            from . import servo_path as sp
+        except ImportError:
+            import servo_path as sp
+        cycle = float(self.a.servo_cycle)
+        s_ticks = sp.ticks(g, cycle)
+        q_ticks = sp.joints_at(g, s_ticks)
+        owners = g.owner[np.clip(np.searchsorted(g.s, s_ticks, side="right") - 1, 0, len(g.owner) - 1)]
+        start = [float(v) for v in g.joints[0]]
+        start_pose = [float(v) for v in g.xyz[0]] + [float(v) for v in g.rpy[0]]
+
+        self.wait_idle()
+        here = self.current_joints()
+        if max(abs((a - b + 180.0) % 360.0 - 180.0) for a, b in zip(here, start)) > 0.5:
+            # the arm is not at the start of the path (the file starts with a G1): get there with a joint move
+            self.log(f"  moving to the start of the fixed-speed path (line {cmds[g.first].line}) with MoveJ")
+            self.check(self.robot.MoveJ(joint_pos=start, tool=self.a.tool, user=self.a.user, desc_pos=start_pose,
+                                        vel=100.0, blendT=self.exact(-1.0)), "MoveJ", cmds[g.first].line)
+            self.settle(-1.0)
+            self.wait_idle()
+
+        transport = self.servo_transport()
+        how = "UDP" if transport == 1 else "XML-RPC"
+        win = sys.platform == "win32"
+        if win:                                   # 1 ms timer resolution while streaming (Windows default: 15.6 ms)
+            try:                                  # and this thread first in line for the CPU
+                import ctypes
+                ctypes.windll.winmm.timeBeginPeriod(1)
+                thread, priority = ctypes.windll.kernel32.GetCurrentThread(), None
+                priority = ctypes.windll.kernel32.GetThreadPriority(thread)
+                ctypes.windll.kernel32.SetThreadPriority(thread, 15)        # THREAD_PRIORITY_TIME_CRITICAL
+            except Exception:
+                win = False
+        # Python runs one thread at a time: a GUI redrawing in another thread would hold this one up for
+        # its whole 5 ms switch interval. 0.5 ms while streaming (measured: 40 late points -> 6 on demo_part)
+        switch = sys.getswitchinterval()
+        sys.setswitchinterval(0.0005)
+        self.check(self.sdk_call("ServoMoveStart", cmdType=transport), "ServoMoveStart", cmds[g.first].line)
+        self.servo_used = True
+        late = []
+        current = g.first - 1
+        start_xyz = np.asarray(g.xyz[0])
+        followed = False
+        try:
+            t0 = time.perf_counter() + 0.02
+            for k in range(len(q_ticks)):
+                deadline = t0 + k * cycle
+                self._wait_until(deadline)
+                self.check_abort()
+                own = int(owners[k])
+                while current < own:              # the trace: each command as the stream reaches it
+                    current += 1
+                    self.trace(cmds[current], f" (streamed, {how})")
+                ret = self.sdk_call("ServoJ", joint_pos=[float(v) for v in q_ticks[k]], axisPos=[0.0, 0.0, 0.0, 0.0],
+                                    cmdT=cycle, cmdType=transport)
+                late.append(time.perf_counter() - deadline)
+                if unpack(ret)[0] != 0:
+                    self.check(ret, "ServoJ", cmds[own].line)
+                if k % 25 == 0:                   # every 0.2 s: a fault, and does the arm follow at all?
+                    self.check_robot_fault()
+                    if not followed and k * cycle >= 0.6 and s_ticks[k] >= 3.0:
+                        err, rest = unpack(self.robot.GetActualTCPPose())
+                        moved = float(np.linalg.norm(np.asarray(rest[0][:3]) - start_xyz)) if err == 0 else 0.0
+                        if moved < 0.2 * float(s_ticks[k]):
+                            raise RobotCommandError(
+                                f"The arm does not follow the ServoJ commands ({how}): after {k * cycle:.1f} s it "
+                                f"has moved {moved:.1f} mm of {float(s_ticks[k]):.1f} mm. Check that the controller "
+                                "accepts servo commands" +(" over UDP (port 20007), or use --servo-transport xmlrpc"
+                                                    if transport == 1 else "") + ".")
+                        followed = True
+            while current < g.last:
+                current += 1
+                self.trace(cmds[current], f" (streamed, {how})")
+            # let the arm arrive at the end of the path
+            end = [float(v) for v in g.joints[-1]]
+            deadline = time.perf_counter() + 2.0
+            while time.perf_counter() < deadline:
+                self.check_abort()
+                if max(abs((a - b + 180.0) % 360.0 - 180.0) for a, b in zip(self.current_joints(), end)) < 0.05:
+                    break
+                time.sleep(0.01)
+        except (Aborted, RobotCommandError):
+            try:                                  # points the controller may still hold must not run
+                if hasattr(self.robot, "MotionQueueClear"):
+                    self.robot.MotionQueueClear()
+            except Exception:
+                pass
+            raise
+        finally:
+            sys.setswitchinterval(switch)
+            try:
+                self.sdk_call("ServoMoveEnd", cmdType=transport)
+            finally:
+                if win:
+                    try:
+                        import ctypes
+                        ctypes.windll.winmm.timeEndPeriod(1)
+                        if priority is not None:
+                            ctypes.windll.kernel32.SetThreadPriority(thread, priority)
+                    except Exception:
+                        pass
+        lag = np.asarray(late) * 1000.0
+        missed = int(np.sum(lag > cycle * 1000.0))
+        self.log(f"  streamed {len(q_ticks)} ServoJ ({how}, every {cycle * 1000:g} ms): sent on time to "
+                 f"{np.percentile(lag, 99):.1f} ms (99 %), worst {lag.max():.1f} ms"
+                 + (f"; {missed} sent more than one cycle late - the speed may dip there" if missed else ""))
+        self.last_j = [float(v) for v in g.joints[-1]]
+        self.last_pose = [float(v) for v in g.xyz[-1]] + [float(v) for v in g.rpy[-1]]
 
     def send(self, c, blend=-1.0):
         if c.kind == "line":
@@ -915,6 +1142,11 @@ class Streamer:
                 return call()
 
         try:
+            if self.servo_used and hasattr(self.robot, "MotionQueueClear"):
+                try:                                 # servo points the controller may still hold
+                    self.robot.MotionQueueClear()
+                except Exception:
+                    pass
             twice(self.robot.StopMotion)
         finally:
             if self.spindle_on and self.a.spindle_do >= 0:
@@ -959,9 +1191,15 @@ def build_parser():
     p.add_argument("--global-speed", type=int, default=20,
                    help="speed of every move, %% of the robot's full speed (F / S in the file are ignored); "
                         "with --speed-mode physical only of the MoveJ")
-    p.add_argument("--speed-mode", choices=["percent", "physical"], default="percent",
+    p.add_argument("--speed-mode", choices=["percent", "physical", "servo"], default="percent",
                    help="percent: every move at --global-speed %%; physical: MoveL / MoveC / Circle at "
-                        "--tcp-speed mm/s and --acc mm/s^2 (velAccParamMode 1), for a steady TCP speed")
+                        "--tcp-speed mm/s and --acc mm/s^2 (velAccParamMode 1); servo: G1 / G2 / G3 streamed "
+                        "point by point with ServoJ at a fixed --tcp-speed (corners rounded for --acc)")
+    p.add_argument("--servo-transport", choices=["auto", "udp", "xmlrpc"], default="auto",
+                   help="servo mode: how ServoJ is sent (auto: UDP if the SDK can)")
+    p.add_argument("--servo-cycle", type=float, default=0.008, help=argparse.SUPPRESS)        # s, ServoJ period
+    p.add_argument("--servo-joint-speed", type=float, default=150.0, help=argparse.SUPPRESS)  # deg/s at most
+    p.add_argument("--servo-max-step", type=float, default=5.0, help=argparse.SUPPRESS)       # deg between knots
     p.add_argument("--tcp-speed", type=float, default=20.0, metavar="MM/S",
                    help="TCP speed of MoveL / MoveC / Circle with --speed-mode physical")
     p.add_argument("--acc", type=float, default=200.0, metavar="MM/S2",
@@ -1002,6 +1240,9 @@ def main():
         p.error("--ref-point and --origin-here cannot be combined")
     if a.tcp_speed <= 0 or a.acc <= 0:
         p.error("--tcp-speed and --acc must be above 0")
+    if a.export and servo(a):
+        p.error("--export is not available with --speed-mode servo yet (the script would have to carry every "
+                "joint position of the stream)")
 
     with open(a.file, "r", errors="replace") as f:
         cmds, warnings = parse_gcode(f.read(), a.feed, a.dwell_ms, a.arc_split)

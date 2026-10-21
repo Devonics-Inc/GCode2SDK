@@ -821,6 +821,12 @@ class MainWindow(QtWidgets.QMainWindow):
         """Save the checked plan as a stand-alone Python script for the FAIRINO SDK."""
         if self.checked is None or self.job is not None:
             return
+        if eng.servo(self.checked.settings):
+            QtWidgets.QMessageBox.information(
+                self, "Export Python",
+                "Export is not available for the fixed-speed (ServoJ) mode yet: the script would have to carry "
+                "every joint position of the stream.\n\nSet up the run with one of the other speed modes to export.")
+            return
         simple, checked = "Simple script - plain SDK calls (*.py)", "Script with safety checks (*.py)"
         path, chosen = QtWidgets.QFileDialog.getSaveFileName(
             self, "Export as Python script", default_name(self.checked.path), f"{simple};;{checked}")

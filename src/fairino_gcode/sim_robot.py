@@ -32,6 +32,14 @@ def fake_joints(pose):
     return [pose[0] / 10.0, pose[1] / 10.0, pose[2] / 10.0, pose[3] / 2.0, pose[4] / 2.0, pose[5] / 2.0]
 
 
+def fake_pose(joints):
+    """The pose of fake_joints() - its forward kinematics."""
+    return [joints[0] * 10.0, joints[1] * 10.0, joints[2] * 10.0, joints[3] * 2.0, joints[4] * 2.0, joints[5] * 2.0]
+
+
+ERR_NOT_IN_SERVO = 14            # a ServoJ outside ServoMoveStart / ServoMoveEnd
+
+
 def _wrap(d):
     return (d + 180.0) % 360.0 - 180.0
 
@@ -96,6 +104,9 @@ class SimRobot:
         self.travelled = []                      # XYZ every <= 0.25 mm along what was actually executed
         self.fail_next = {}                      # {"MoveL": 14} -> the next MoveL returns error 14
         self.fault = (0, 0)                      # (main, sub) error code reported by GetRobotErrorCode
+        self.servo = False                       # between ServoMoveStart and ServoMoveEnd
+        self.ignore_servo = False                # test: answer ServoJ with 0 but do not move (a controller
+                                                 # that does not take the commands)
         self.robot_state_pkg = SimpleNamespace(tl_cur_pos=list(start_pose))
 
         self._cv = threading.Condition()
@@ -141,7 +152,8 @@ class SimRobot:
                 self.travelled += [seg["path"](u * k / n)[:3] for k in range(1, n + 1)]
                 seg["stopped"] = stopped
                 self._active = None
-                self._speed = 0.0
+                if stopped or not (self._queue or self.servo):
+                    self._speed = 0.0                # (a servo stream keeps its speed between its tiny moves)
                 seg["done"].set()
                 self._cv.notify_all()
 
@@ -230,6 +242,45 @@ class SimRobot:
                vel_p=20.0, vel_t=20.0, ovl=100.0, blendR=-1.0, oacc=100.0, velAccParamMode=0, **_):
         return self._circular("Circle", True, desc_pos_p, desc_pos_t, tool_t, user_t, vel_t, ovl, blendR,
                               oacc, velAccParamMode)
+
+    # ------------------------------------------------------------------ servo mode
+    def ServoMoveStart(self, cmdType=0):
+        with self._cv:
+            self.calls.append(("ServoMoveStart", dict(cmdType=cmdType)))
+            self.servo = True
+        return 0
+
+    def ServoMoveEnd(self, cmdType=0):
+        with self._cv:
+            self.calls.append(("ServoMoveEnd", dict(cmdType=cmdType)))
+            self.servo = False
+            if self._active is None and not self._queue:
+                self._speed = 0.0
+        return 0
+
+    def ServoJ(self, joint_pos, axisPos, acc=0.0, vel=0.0, cmdT=0.008, filterT=0.0, gain=0.0, id=0, cmdType=0):
+        """Move to the pose of these joints within cmdT (a servo set point), not blocking."""
+        if not self.servo:
+            with self._cv:
+                self.calls.append(("ServoJ", dict(joint_pos=list(joint_pos), refused=True)))
+            return ERR_NOT_IN_SERVO
+        if self.ignore_servo:
+            with self._cv:
+                self.calls.append(("ServoJ", dict(joint_pos=list(joint_pos), ignored=True)))
+            return 0
+        start, end = list(self._planned_end), fake_pose([float(v) for v in joint_pos])
+        return self._enqueue("ServoJ", lambda u: _lerp_pose(start, end, u), math.dist(start[:3], end[:3]),
+                             float(cmdT), False, dict(joint_pos=list(joint_pos), cmdT=cmdT, cmdType=cmdType))
+
+    def MotionQueueClear(self):
+        with self._cv:
+            self.calls.append(("MotionQueueClear", {}))
+            for seg in self._queue:
+                seg["stopped"] = True
+                seg["done"].set()
+            self._queue.clear()
+            self._planned_end = self.pose
+        return 0
 
     def StopMotion(self):
         with self._cv:

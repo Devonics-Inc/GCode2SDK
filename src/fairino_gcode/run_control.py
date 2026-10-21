@@ -86,9 +86,12 @@ class RunSetup:
         turned = f", drawing turned {self.yaw:g}\u00b0" if self.yaw and self.placement != AUTO else ""
         posture = ("tool turns with the path" if self.turn_with_path else "fixed posture") \
             + (", straight down" if self.tool_down else "")
-        speed = (f"TCP speed {self.tcp_speed:g} mm/s (acc {self.acc:g} mm/s²), MoveJ {self.global_speed} %"
-                 if self.speed_mode == "physical" else f"global speed {self.global_speed} %")
-        return f"{where}{turned}; {posture}; {speed}; blend {self.blend:g} mm"
+        speed = {"physical": f"TCP speed {self.tcp_speed:g} mm/s (acc {self.acc:g} mm/s²), "
+                             f"MoveJ {self.global_speed} %; blend {self.blend:g} mm",
+                 "servo": f"fixed TCP speed {self.tcp_speed:g} mm/s streamed with ServoJ (acc {self.acc:g} "
+                          f"mm/s²), MoveJ {self.global_speed} %"}.get(
+            self.speed_mode, f"global speed {self.global_speed} %; blend {self.blend:g} mm")
+        return f"{where}{turned}; {posture}; {speed}"
 
 
 class RunSetupDialog(QtWidgets.QDialog):
@@ -217,10 +220,15 @@ class RunSetupDialog(QtWidgets.QDialog):
         self.spindle_do.setValue(setup.spindle_do)
         self.spindle_do.setSpecialValueText("none")
 
-        # speed: one % for everything, or a TCP speed in mm/s for the feed moves
+        # speed: one % for everything, a TCP speed in mm/s for the feed moves, or a fixed speed streamed
         self.by_percent = QtWidgets.QRadioButton("% of the robot's full speed, for every move")
         self.by_physical = QtWidgets.QRadioButton("Constant TCP speed in mm/s for MoveL / MoveC / Circle")
-        (self.by_physical if setup.speed_mode == "physical" else self.by_percent).setChecked(True)
+        self.by_servo = QtWidgets.QRadioButton("Fixed TCP speed: stream the path point by point (ServoJ)")
+        self.by_servo.setToolTip(
+            "The app plans the motion itself and sends a joint position every 8 ms, so the TCP keeps the\n"
+            "speed through the joins between G-code lines. Sharp corners are rounded so the acceleration\n"
+            "is enough; the plan summary says how much, and where the speed still has to drop.")
+        {"physical": self.by_physical, "servo": self.by_servo}.get(setup.speed_mode, self.by_percent).setChecked(True)
         self.tcp_speed = spin(setup.tcp_speed, 0.5, 1000.0, 5.0, 1, " mm/s")
         self.acc = spin(setup.acc, 10.0, 10000.0, 50.0, 0, " mm/s²")
         self.acc.setToolTip("Halved automatically if the controller refuses it (error 183).")
@@ -239,10 +247,13 @@ class RunSetupDialog(QtWidgets.QDialog):
         form = QtWidgets.QFormLayout(run)
         form.addRow(self.by_percent)
         form.addRow(self.by_physical)
+        form.addRow(self.by_servo)
+        form.addRow(note("Fixed speed: corners are rounded by up to (speed² / acceleration); the Summary says\n"
+                         "by how much and where the speed still has to drop. Try it slowly first."))
         form.addRow(physical_box)
         form.addRow("Speed %", self.global_speed)
         hint = note("% mode: every move runs at this % of the robot's full speed.\n"
-                    "mm/s mode: only the MoveJ (G0) do.\n"
+                    "mm/s and fixed speed: only the MoveJ (G0) do.\n"
                     "F and S in the G-code are ignored. Start low for a first run.")
         hint.setStyleSheet("color: #6b7280;")
         form.addRow("", hint)
@@ -276,7 +287,7 @@ class RunSetupDialog(QtWidgets.QDialog):
         outer.addWidget(self.message)
         outer.addWidget(buttons)
         for button in (self.by_ref, self.by_here, self.by_auto, self.by_manual, self.auto_rotate,
-                       self.by_percent, self.by_physical):
+                       self.by_percent, self.by_physical, self.by_servo):
             button.toggled.connect(self._enable)
         self._enable()
         self._fit_to_screen(content, parent)
@@ -304,7 +315,8 @@ class RunSetupDialog(QtWidgets.QDialog):
         self.auto_rotate.setEnabled(self.by_auto.isChecked())
         self.yaw.setEnabled(not (self.by_auto.isChecked() and self.auto_rotate.isChecked()))
         self.manual_box.setEnabled(self.by_manual.isChecked())
-        self.physical_box.setEnabled(self.by_physical.isChecked())
+        self.physical_box.setEnabled(self.by_physical.isChecked() or self.by_servo.isChecked())
+        self.blend.setEnabled(not self.by_servo.isChecked())    # fixed speed rounds the corners itself
 
     def setup(self) -> RunSetup:
         placement = (REF if self.by_ref.isChecked() else HERE if self.by_here.isChecked() else
@@ -316,7 +328,8 @@ class RunSetupDialog(QtWidgets.QDialog):
                         auto_range=self.auto_range.value(), auto_rotate=self.auto_rotate.isChecked(),
                         yaw=self.yaw.value(), turn_with_path=self.turn_posture.isChecked(),
                         tool_down=self.tool_down.isChecked(),
-                        speed_mode="physical" if self.by_physical.isChecked() else "percent",
+                        speed_mode=("servo" if self.by_servo.isChecked() else
+                                    "physical" if self.by_physical.isChecked() else "percent"),
                         tcp_speed=self.tcp_speed.value(), acc=self.acc.value(), blend=self.blend.value())
 
     def accept(self):
