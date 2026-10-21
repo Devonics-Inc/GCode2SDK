@@ -18,7 +18,9 @@ records the TCP speed from the robot's status stream and measures how far it str
                  are marked "stop": the arm halts there on purpose.
 
 The speed is the status item actual_TCP_cmpvel (TCP speed, mm/s). If the controller does not send
-it, the speed is worked out from the change in TCP position over about 0.2 s.
+it, the speed is worked out from the change in TCP position over about 0.2 s. While the TCP position
+stands still (under STILL_MM in STILL_WINDOW_S) the speed is taken as 0: the reported speed of a robot
+at rest is noise.
 
 No Qt in here - speed_view.py draws it.
 """
@@ -38,6 +40,11 @@ SPEED = "actual_TCP_cmpvel"     # status item: [TCP speed mm/s, ...]
 RECEIVED = "_received"          # added by robot_monitor.py: time.monotonic() when the frame arrived
 MOVING_MM_S = 1.0               # slower than this = standing still (status noise is ~0.2 mm/s)
 DIFF_WINDOW_S = 0.2             # speed from positions: over at least this much time
+# Standstill filter. A robot at rest reports a TCP speed that jitters between 0 and ~1 mm/s while its
+# position changes by ~0.001 mm. So "standing still" is decided from the position: if the TCP has not
+# moved STILL_MM in the last STILL_WINDOW_S, the speed is 0 (any motion faster than ~0.2 mm/s shows).
+STILL_MM = 0.05
+STILL_WINDOW_S = 0.25
 MAX_SAMPLES = 20 * 3600         # one hour at 20 samples per second
 FEED, RAPID = "feed", "rapid"   # what the arm is doing: a G1/G2/G3 move, or a G0 (MoveJ)
 
@@ -115,9 +122,25 @@ class SpeedRecorder:
             return                                       # same frame twice, or a clock step back
         if v is None:
             v = self._from_positions(rel, xyz)
+        v = abs(float(v))
+        if self._still(rel, xyz, v):
+            v = 0.0                                      # status noise, not motion
         self.t.append(rel)
         self.xyz.append(xyz)
-        self.v.append(abs(float(v)))
+        self.v.append(v)
+
+    def _still(self, t: float, xyz, v: float) -> bool:
+        """True if the TCP has moved less than STILL_MM from any position of the last STILL_WINDOW_S."""
+        if not self.t:
+            return v < MOVING_MM_S                       # nothing to compare with yet
+        moved = 0.0
+        for k in range(len(self.t) - 1, -1, -1):          # newest first; stops after ~0.25 s of samples
+            moved = max(moved, math.dist(xyz, self.xyz[k]))
+            if moved >= STILL_MM:
+                return False
+            if t - self.t[k] >= STILL_WINDOW_S:
+                break
+        return True
 
     def add_sample(self, sample: dict, t: Optional[float] = None) -> bool:
         """A status-stream sample (dict). Returns False if it has no TCP position."""
