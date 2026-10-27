@@ -128,9 +128,9 @@ def build_script(cmds, a, source: str, summary=(), ip: str = "192.168.58.25", ch
             ("EXACT = -1.0", "the move ends exactly on its point"),
             (f"QUEUE_MAX = {int(a.queue_max)}", "moves queued on the controller at most"),
             (f"SPINDLE_DO = {int(a.spindle_do)}",
-             "control-box output for M3 / M5: 0-7 = DO0-DO7, 8-15 = CO0-CO7 (-1 = none)"),
+             "output for M3 / M5: 0-7 DO0-DO7, 8-15 CO0-CO7, 16-17 Tool DO0-DO1 (-1 = none)"),
             (f"OUTPUT_REST = {[(p, on) for p, on in rest]!r}",
-             "per-line outputs (DO / CO number, high?) outside the G-code lines"),
+             "per-line outputs (number as SPINDLE_DO, high?) outside the G-code lines"),
             (f"START_WAIT = {num(a.start_wait)}", 's to wait for "motion done" to drop after a move is sent'),
             (f"STEPS, TARGETS = {n_steps}, {n_targets}", "")]
     width = max(len(code) for code, _ in rows) + 2
@@ -194,6 +194,18 @@ def unpack(ret):
 
 def fmt(p):
     return "[" + ", ".join(f"{round(v, 3) + 0.0:.3f}" for v in p) + "]"
+
+
+def output_text(pin, on):
+    """Outputs 0-7 = DO0-DO7 and 8-15 = CO0-CO7 (SetDO), 16-17 = Tool DO0-DO1 (SetToolDO 0-1)."""
+    if pin >= 16:
+        return f"SetToolDO({pin - 16}, {int(on)}) Tool DO{pin - 16} {'high' if on else 'low'}"
+    return f"SetDO({pin}, {int(on)}) {'DO' if pin < 8 else 'CO'}{pin % 8} {'high' if on else 'low'}"
+
+
+def set_output(robot, pin, on):
+    """Switch output `pin` (numbered as in output_text) with SetDO or SetToolDO."""
+    return robot.SetToolDO(pin - 16, int(on)) if pin >= 16 else robot.SetDO(pin, int(on))
 
 
 FEED_SPEED = f"{TCP_SPEED:g} mm/s" if SPEED_MODE == "physical" else f"{GLOBAL_SPEED} %"   # MoveL / MoveC / Circle
@@ -354,8 +366,8 @@ class Job:
         if SPINDLE_DO < 0:
             self.say(line, src, "skipped (SPINDLE_DO = -1)")
             return
-        self.say(line, src, f"SetDO({SPINDLE_DO}, {int(on)})")
-        self.check(self.robot.SetDO(SPINDLE_DO, int(on)), "SetDO", line)
+        self.say(line, src, output_text(SPINDLE_DO, on))
+        self.check(set_output(self.robot, SPINDLE_DO, on), "SetToolDO" if SPINDLE_DO >= 16 else "SetDO", line)
         self.spindle_on = bool(on)
 
     def set_outputs(self, outputs, line, src):
@@ -363,10 +375,9 @@ class Job:
         if self.dry:
             return
         self.wait_idle()
-        self.say(line, src, ", ".join(f"SetDO({pin}, {int(on)}) {'DO' if pin < 8 else 'CO'}{pin % 8} "
-                                      f"{'high' if on else 'low'}" for pin, on in outputs))
+        self.say(line, src, ", ".join(output_text(pin, on) for pin, on in outputs))
         for pin, on in outputs:
-            self.check(self.robot.SetDO(pin, int(on)), "SetDO", line)
+            self.check(set_output(self.robot, pin, on), "SetToolDO" if pin >= 16 else "SetDO", line)
         self.outputs_live = True
 
     def rest_outputs(self, call=None):
@@ -374,7 +385,7 @@ class Job:
         if self.dry:
             return
         for pin, on in OUTPUT_REST:
-            (call or (lambda f: f()))(lambda pin=pin, on=on: self.robot.SetDO(pin, int(on)))
+            (call or (lambda f: f()))(lambda pin=pin, on=on: set_output(self.robot, pin, on))
         self.outputs_live = True
 
     def pause(self, line, src):
@@ -390,7 +401,7 @@ class Job:
             return
         self.wait_idle()
         if self.spindle_on:
-            self.robot.SetDO(SPINDLE_DO, 0)
+            set_output(self.robot, SPINDLE_DO, 0)
             self.spindle_on = False
         if self.outputs_live:
             self.rest_outputs()
@@ -415,7 +426,7 @@ class Job:
             twice(self.robot.StopMotion)
         finally:
             if self.spindle_on and SPINDLE_DO >= 0:
-                twice(lambda: self.robot.SetDO(SPINDLE_DO, 0))
+                twice(lambda: set_output(self.robot, SPINDLE_DO, 0))
                 self.spindle_on = False
             if self.outputs_live:
                 self.rest_outputs(twice)
@@ -486,6 +497,13 @@ def svec(p) -> str:
     return "[" + ", ".join(short(v) for v in p) + "]"
 
 
+def do_line(pin, on, comment=True) -> str:
+    """The SDK call that switches output `pin` (0-17): robot.SetDO(...) or robot.SetToolDO(...)."""
+    call, number = eng.output_call(pin)
+    text = f"robot.{call}({number}, {int(bool(on))})"
+    return text + (f"   # {eng.output_name(pin)} {'high' if on else 'low'}" if comment else "")
+
+
 def build_simple_script(cmds, a, source: str, summary=(), ip: str = "192.168.58.25", note: str = "") -> str:
     """The job as a flat list of SDK calls, like the FAIRINO SDK examples: one robot.MoveJ / MoveL /
     MoveC / Circle per G-code command, every argument written out. Every move is blocking
@@ -502,8 +520,7 @@ def build_simple_script(cmds, a, source: str, summary=(), ip: str = "192.168.58.
 
     def rest_outputs(why):
         body.append(f"# per-line outputs at their state outside the lines: {why}")
-        body.extend(f"robot.SetDO({p}, {int(on)})   # {eng.output_name(p)} {'high' if on else 'low'}"
-                    for p, on in rest)
+        body.extend(do_line(p, on) for p, on in rest)
     # physical mode: MoveL / MoveC / Circle at TCP_SPEED mm/s and ACC mm/s^2 instead of the global %
     phys = eng.physical(a)
     units = ", ovl=TCP_SPEED, oacc=ACC, velAccParamMode=1" if phys else ""
@@ -558,7 +575,7 @@ def build_simple_script(cmds, a, source: str, summary=(), ip: str = "192.168.58.
             on = int(c.code != 5)
             body.append(f"# {where(c)}")
             if do >= 0:
-                body.append(f"robot.SetDO({do}, {on})   # {eng.output_name(do)}")
+                body.append(do_line(do, on))
                 spindle_on = bool(on)
             else:
                 body.append(f"# (no output chosen for M3 / M5 - this would be robot.SetDO(<DO>, {on}))")
@@ -568,10 +585,10 @@ def build_simple_script(cmds, a, source: str, summary=(), ip: str = "192.168.58.
         elif c.kind == "do":
             body.append(f"# {where(c)} - per-line outputs")
             for pin, on in c.outputs:
-                body.append(f"robot.SetDO({int(pin)}, {int(on)})   # {eng.output_name(pin)} {'high' if on else 'low'}")
+                body.append(do_line(pin, on))
     if spindle_on:
         body.append("# switch the output off at the end")
-        body.append(f"robot.SetDO({do}, 0)   # {eng.output_name(do)}")
+        body.append(do_line(do, 0))
     if rest:
         rest_outputs("the end of the job")
     if lift > 0 and last_pose is not None:
@@ -627,7 +644,7 @@ try:
     print("Done.")
 except KeyboardInterrupt:
     robot.StopMotion()
-''' + "".join(f"    robot.SetDO({p}, {int(on)})\n" for p, on in rest) + '''    print("Stopped.")
+''' + "".join(f"    {do_line(p, on, comment=False)}\n" for p, on in rest) + '''    print("Stopped.")
 finally:
     robot.CloseRPC()
 '''

@@ -185,7 +185,8 @@ def test_outputs_0_to_7_are_do0_to_do7_and_8_to_15_are_co0_to_co7(qapp, tmp_path
     assert eng.set_do_text(9, True) == "SetDO(9, 1) CO1 high"
     dialog = RunSetupDialog(RunSetup(placement=HERE, spindle_do=-1), lines=[(1, "G1 X10"), (2, "G1 X20")])
     names = [dialog.out_pin[0].itemText(i) for i in range(dialog.out_pin[0].count())]
-    assert [n for n in names if n] == [f"DO{i}" for i in range(8)] + [f"CO{i}" for i in range(8)]
+    assert [n for n in names if n] == [f"DO{i}" for i in range(8)] + [f"CO{i}" for i in range(8)] + \
+        ["Tool DO0", "Tool DO1"]
     assert dialog.spindle_do.currentText() == "none" and dialog.spindle_do.value() == -1
     dialog.out_use[0].setChecked(True)
     dialog.out_pin[0].setValue(10)                            # CO2 is SetDO number 10
@@ -427,3 +428,94 @@ def test_the_per_line_headers_are_never_cut_off(qapp):
         text = table.horizontalHeaderItem(col).text()
         assert table.columnWidth(col) >= metrics.horizontalAdvance(text), (col, text)
     assert table.columnWidth(2) >= header.sectionSizeFromContents(2).width()   # "Robot command", padding included
+
+
+# ------------------------------------------------------------------ tool (end-effector) outputs
+def test_outputs_16_and_17_are_the_tool_outputs():
+    assert [eng.output_name(p) for p in (7, 15, 16, 17)] == ["DO7", "CO7", "Tool DO0", "Tool DO1"]
+    assert eng.output_call(8) == ("SetDO", 8) and eng.output_call(17) == ("SetToolDO", 1)
+    assert eng.set_do_text(16, True) == "SetToolDO(0, 1) Tool DO0 high"
+    sim = sim_robot.SimRobot()
+    eng.set_output(sim, 17, True)
+    eng.set_output(sim, 5, True)
+    assert sim.tool_do == {1: 1} and sim.do == {5: 1}
+
+
+def test_a_run_switches_the_tool_outputs_with_settooldo():
+    """Tool DO0 per line (low outside the lines... and high there for Tool DO1), M3 / M5 on control-box DO2."""
+    a = settings(outputs=[16, 17], output_lines={n: [True, False] for n in OUTLINE}, output_defaults=[False, True],
+                 spindle_do=2, approach=20.0)
+    sim = sim_robot.SimRobot(time_scale=200)
+    frame = eng.resolve_frame(a, sim, log=lambda *_: None)
+    plan = build_plan(DEMO, a, frame)
+    s = eng.Streamer(sim, frame, a)
+    s.stoppable, s.log, s.pause, s.on_command = True, (lambda *_: None), (lambda *_: None), (lambda *_: None)
+    s.prepare()
+    s.run(plan.cmds)
+    tool = [(k["id"], k["status"]) for n, k in sim.calls if n == "SetToolDO"]
+    assert (0, 1) in tool and (0, 0) in tool and (1, 1) in tool
+    assert all(k["id"] < 16 for n, k in sim.calls if n == "SetDO")      # never SetDO(16 / 17)
+    assert sim.tool_do == {0: 0, 1: 1}                                 # outside the lines at the end
+    assert sim.do[2] == 0                                              # M5 switched DO2 off
+    k = next(k for k, c in enumerate(plan.cmds) if c.kind == "do" and c.line == 9)
+    assert eng.describe(plan.cmds[k], a).endswith("SetToolDO(0, 1) Tool DO0 high")
+
+
+def test_m3_m5_can_use_a_tool_output_and_a_stop_switches_it_off():
+    a = settings(spindle_do=17)
+    sim = sim_robot.SimRobot(time_scale=200)
+    frame = eng.resolve_frame(a, sim, log=lambda *_: None)
+    plan = build_plan(DEMO, a, frame)
+    m3 = next(c for c in plan.cmds if c.kind == "m" and c.code == 3)
+    assert eng.describe(m3, a).endswith("SetToolDO(1, 1) Tool DO1 high")
+    s = eng.Streamer(sim, frame, a)
+    s.stoppable, s.log, s.pause, s.on_command = True, (lambda *_: None), (lambda *_: None), (lambda *_: None)
+    s.prepare()
+    s.run(plan.cmds)
+    assert [(k["id"], k["status"]) for n, k in sim.calls if n == "SetToolDO"] == [(1, 1), (1, 0)]
+    assert 17 not in sim.do
+    s.spindle_on = True
+    sim.SetToolDO(1, 1)
+    s.emergency_stop()
+    assert sim.tool_do[1] == 0
+
+
+def test_the_dialog_offers_the_tool_outputs(qapp):
+    dialog = RunSetupDialog(RunSetup(placement=HERE), lines=[(1, "G1 X10"), (2, "G1 X20")])
+    names = [n for n in (dialog.out_pin[0].itemText(i) for i in range(dialog.out_pin[0].count())) if n]
+    assert names[-2:] == ["Tool DO0", "Tool DO1"] and len(names) == 18
+    assert "Tool DO1" in [dialog.spindle_do.itemText(i) for i in range(dialog.spindle_do.count())]
+    dialog.out_use[0].setChecked(True)
+    dialog.out_pin[0].setValue(16)
+    assert dialog.line_table.horizontalHeaderItem(dialog.OUT0).text() == "Tool DO0"
+    dialog.spindle_do.setValue(16)                                     # the same output twice
+    dialog.accept()
+    assert dialog.chosen is None and "Tool DO0 is already the output for M3 / M5" in dialog.message.text()
+    dialog.spindle_do.setValue(17)
+    dialog.accept()
+    assert dialog.chosen.outputs == [16] and dialog.chosen.spindle_do == 17
+    assert "Tool DO0 set per line" in dialog.chosen.describe()
+
+
+def test_both_exported_scripts_use_settooldo_for_the_tool_outputs(tmp_path):
+    a = settings(outputs=[16], output_lines={n: [True] for n in OUTLINE}, output_defaults=[False], spindle_do=17,
+                 approach=20.0)
+    plan = build_plan(DEMO, a)
+    with open(export_script.export_plan(plan, str(tmp_path / "s.py"))) as f:
+        simple = f.read()
+    assert "robot.SetToolDO(0, 1)   # Tool DO0 high" in simple and "robot.SetToolDO(1, 1)   # Tool DO1 high" in simple
+    assert "SetDO(16" not in simple and "SetDO(17" not in simple
+    assert "    robot.SetToolDO(0, 0)\n    print(\"Stopped.\")" in simple           # Ctrl-C: back to rest
+    with open(export_script.export_plan(plan, str(tmp_path / "c.py"), style="checked")) as f:
+        checked = f.read()
+    assert "SPINDLE_DO = 17" in checked and "OUTPUT_REST = [(16, False)]" in checked
+    assert "job.set_outputs([(16, True)], 9," in checked
+    # the script's own helper sends the right call
+    ns = {"SPEED_MODE": "percent", "TCP_SPEED": 20.0, "GLOBAL_SPEED": 20}     # the script's settings
+    exec(checked.split("# ============================================================================ runtime")[1]
+         .split("class Job:")[0], ns)
+    sim = sim_robot.SimRobot()
+    ns["set_output"](sim, 16, True)
+    ns["set_output"](sim, 9, True)
+    assert sim.tool_do == {0: 1} and sim.do == {9: 1}
+    assert ns["output_text"](17, False) == "SetToolDO(1, 0) Tool DO1 low"

@@ -99,7 +99,8 @@ class SimRobot:
         }
         self.teach_points.update(teach_points or {})
         self.global_speed = 100
-        self.do = {}                             # digital outputs
+        self.do = {}                             # control-box digital outputs (SetDO)
+        self.tool_do = {}                        # tool (end-effector) outputs (SetToolDO)
         self.calls = []                          # (name, kwargs) of everything that was commanded
         self.travelled = []                      # XYZ every <= 0.25 mm along what was actually executed
         self.fail_next = {}                      # {"MoveL": 14} -> the next MoveL returns error 14
@@ -361,6 +362,10 @@ class SimRobot:
     def SetDO(self, id, status, *_, **__):
         self.do[id] = status
         return self._record("SetDO", id=id, status=status)
+
+    def SetToolDO(self, id, status, *_, **__):
+        self.tool_do[id] = status
+        return self._record("SetToolDO", id=id, status=status)
 
     def CloseRPC(self):
         with self._cv:

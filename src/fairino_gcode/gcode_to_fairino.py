@@ -18,11 +18,12 @@ Supported G-code:
     M0/M1            pause (press Enter)   M2/M30 end of program
 Anything else is reported as a warning and ignored.
 
-Control-box outputs are numbered as SetDO numbers them: 0-7 = DO0-DO7 (digital outputs), 8-15 = CO0-CO7
-(configurable outputs); output_name() gives the name.
+Outputs are numbered 0-17: 0-7 = control-box DO0-DO7 (digital outputs), 8-15 = control-box CO0-CO7
+(configurable outputs) - the numbers SetDO takes - and 16-17 = the tool (end-effector) outputs Tool DO0-DO1,
+switched with SetToolDO(0 / 1). output_name() gives the name, set_output() sends the right call.
 
 Per-line outputs (the GUI's "Per line" setup, add_outputs()): up to 3 control-box outputs, each set high or low
-for every G-code line. Where a state changes, the arm stops at the start of that line and SetDO is sent,
+for every G-code line. Where a state changes, the arm stops at the start of that line and SetDO / SetToolDO is sent,
 so the output switches exactly there. Outside the lines - during the approach and the retract move, after
 the job ends, and when it is stopped or fails - each output takes its default state (rest_states()).
 Per-line delays (same tab, add_delays()): a line can wait a number of ms before it starts - after its
@@ -334,15 +335,33 @@ def limit_arcs(cmds, scale=1.0, min_gap=MIN_ARC_GAP, tol=ARC_TOL):
     return out, notes
 
 
+TOOL_DO = 16                    # outputs 16 and 17 are the tool (end-effector) outputs Tool DO0 / DO1
+OUTPUTS = 18                    # 0-7 DO, 8-15 CO, 16-17 Tool DO
+
+
 def output_name(pin) -> str:
-    """The name of a control-box output from its SetDO number: 0-7 -> DO0-DO7, 8-15 -> CO0-CO7."""
+    """The name of an output from its number: 0-7 -> DO0-DO7, 8-15 -> CO0-CO7, 16-17 -> Tool DO0-DO1."""
     pin = int(pin)
-    return f"DO{pin}" if pin < 8 else f"CO{pin - 8}"
+    return f"DO{pin}" if pin < 8 else f"CO{pin - 8}" if pin < TOOL_DO else f"Tool DO{pin - TOOL_DO}"
+
+
+def output_call(pin):
+    """(SDK function, its output number): ("SetDO", 0-15) for the control box, ("SetToolDO", 0-1) for the tool."""
+    pin = int(pin)
+    return ("SetToolDO", pin - TOOL_DO) if pin >= TOOL_DO else ("SetDO", pin)
+
+
+def set_output(robot, pin, on):
+    """Switch output `pin` (0-17) high / low on the robot - SetDO or SetToolDO. Returns the SDK's answer."""
+    name, number = output_call(pin)
+    return getattr(robot, name)(number, int(bool(on)))
 
 
 def set_do_text(pin, on) -> str:
-    """One SetDO as the trace and the command list show it: "SetDO(8, 1) CO0 high"."""
-    return f"SetDO({int(pin)}, {int(on)}) {output_name(pin)} {'high' if on else 'low'}"
+    """One output switch as the trace and the command list show it: "SetDO(8, 1) CO0 high",
+    "SetToolDO(1, 0) Tool DO1 low"."""
+    name, number = output_call(pin)
+    return f"{name}({number}, {int(bool(on))}) {output_name(pin)} {'high' if on else 'low'}"
 
 
 def add_outputs(cmds, pins, high):
@@ -872,7 +891,7 @@ class Streamer:
         self.trace(c)
         if c.code in (3, 4, 5) and self.a.spindle_do >= 0:
             on = 0 if c.code == 5 else 1
-            self.check(self.robot.SetDO(self.a.spindle_do, on), "SetDO", c.line)
+            self.check(set_output(self.robot, self.a.spindle_do, on), output_call(self.a.spindle_do)[0], c.line)
             self.spindle_on = bool(on)
         elif c.code in (0, 1):
             self.pause(f"[line {c.line}] M{c.code} pause - press Enter to continue...")
@@ -883,13 +902,13 @@ class Streamer:
         self.wait_idle()
         self.trace(c)
         for pin, on in c.outputs:
-            self.check(self.robot.SetDO(pin, int(on)), "SetDO", c.line)
+            self.check(set_output(self.robot, pin, on), output_call(pin)[0], c.line)
         self.outputs_live = True
 
     def rest_outputs(self, call=None):
         """Every per-line output to its state outside the lines (approach, end of the job, a stop)."""
         for pin, on in rest_states(self.a):
-            (call or (lambda f: f()))(lambda pin=pin, on=on: self.robot.SetDO(pin, int(on)))
+            (call or (lambda f: f()))(lambda pin=pin, on=on: set_output(self.robot, pin, on))
         self.outputs_live = True
 
     # ---- top level
@@ -1025,7 +1044,7 @@ class Streamer:
 
         self.wait_idle()
         if self.spindle_on:
-            self.robot.SetDO(self.a.spindle_do, 0)
+            set_output(self.robot, self.a.spindle_do, 0)
             self.spindle_on = False
         if self.outputs_live:
             self.rest_outputs()
@@ -1269,7 +1288,7 @@ class Streamer:
         finally:
             try:
                 if self.spindle_on and self.a.spindle_do >= 0:
-                    twice(lambda: self.robot.SetDO(self.a.spindle_do, 0))
+                    twice(lambda: set_output(self.robot, self.a.spindle_do, 0))
                     self.spindle_on = False
             finally:
                 if self.outputs_live:
@@ -1337,7 +1356,7 @@ def build_parser():
                    help="approach/retract height mm; default 0 (none) with --ref-point, else 20")
     p.add_argument("--quiet", action="store_true", help="do not print the command-by-command trace")
     p.add_argument("--spindle-do", type=int, default=-1,
-                   help="control-box output for M3/M5: 0-7 = DO0-DO7, 8-15 = CO0-CO7 (-1 = none)")
+                   help="output for M3/M5: 0-7 = DO0-DO7, 8-15 = CO0-CO7, 16-17 = Tool DO0-DO1 (-1 = none)")
     p.add_argument("--dwell-ms", action="store_true", help="treat G4 P as milliseconds (Marlin)")
     p.add_argument("--min-z", type=float, default=None, help="refuse to run if any base Z is below this")
     p.add_argument("--dry-run", action="store_true", help="parse and summarize only, no motion")

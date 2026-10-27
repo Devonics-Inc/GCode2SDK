@@ -116,19 +116,21 @@ class RunSetup:
 
 
 class OutputBox(QtWidgets.QComboBox):
-    """Picks a control-box output: DO0-DO7 (digital outputs) or CO0-CO7 (configurable outputs). value() is
-    the number SetDO takes for it: 0-7 for DO0-DO7, 8-15 for CO0-CO7 (-1 = none, if offered)."""
+    """Picks an output: control-box DO0-DO7 (digital) or CO0-CO7 (configurable), or the tool's (end-effector's)
+    Tool DO0-DO1. value() is its number: 0-7 DO0-DO7, 8-15 CO0-CO7, 16-17 Tool DO0-DO1 (-1 = none, if offered)."""
     valueChanged = Signal(int)
 
     def __init__(self, value: int, none: bool = False, parent=None):
         super().__init__(parent)
         if none:
             self.addItem("none", -1)
-        for pin in range(16):
-            if pin == 8:
+        for pin in range(eng.OUTPUTS):
+            if pin in (8, eng.TOOL_DO):
                 self.insertSeparator(self.count())
             self.addItem(eng.output_name(pin), pin)
-            self.setItemData(self.count() - 1, f"SetDO number {pin}", Qt.ItemDataRole.ToolTipRole)
+            call, number = eng.output_call(pin)
+            where = "on the tool (end-effector) flange" if pin >= eng.TOOL_DO else "in the control box"
+            self.setItemData(self.count() - 1, f"{call}({number}, ...) - {where}", Qt.ItemDataRole.ToolTipRole)
         self.setValue(value)
         self.currentIndexChanged.connect(lambda _i: self.valueChanged.emit(self.value()))
 
@@ -346,7 +348,7 @@ class RunSetupDialog(QtWidgets.QDialog):
 
         tab = QtWidgets.QWidget()
         box = QtWidgets.QVBoxLayout(tab)
-        pins = QtWidgets.QGroupBox("Control-box outputs: DO0-DO7 digital, CO0-CO7 configurable")
+        pins = QtWidgets.QGroupBox("Outputs: control-box DO0-DO7 / CO0-CO7, tool (end-effector) Tool DO0-DO1")
         grid = QtWidgets.QGridLayout(pins)
         head = QtWidgets.QLabel("Outside the lines")
         head.setToolTip("The state of the output whenever no G-code line is running: during the approach and\n"
@@ -586,7 +588,7 @@ class RunSetupDialog(QtWidgets.QDialog):
     def _outputs_problem(self) -> Optional[str]:
         pins = [self.out_pin[k].value() for k in self.used_slots()]
         if len(set(pins)) < len(pins):
-            return "Each output needs its own DO / CO: two outputs use the same one."
+            return "Each output needs its own DO / CO / Tool DO: two outputs use the same one."
         if self.spindle_do.value() >= 0 and self.spindle_do.value() in pins:
             return (f"{eng.output_name(self.spindle_do.value())} is already the output for M3 / M5 (Global tab). "
                     "Choose another one for the per-line outputs.")

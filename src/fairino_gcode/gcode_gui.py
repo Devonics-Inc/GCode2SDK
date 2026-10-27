@@ -365,13 +365,13 @@ class PlanCanvas(FigureCanvasQTAgg):
 
 
 # ============================================================================ command list
-OUTPUT_COLOR = "#7b3fb3"                       # rows the "Per line" setup added: SetDO and waits
+OUTPUT_COLOR = "#7b3fb3"                       # rows the "Per line" setup added: output switches and waits
 
 class CommandTable(QtCore.QAbstractTableModel):
     """One row per command of the plan: what the G-code said and what the robot will be told."""
     HEAD = ["#", "Line", "G-code", "Robot command", "Outputs", "Speed", "In move", "At target"]
     HEAD_TIPS = {4: "Per-line digital outputs (Set up run > Per line) while this command runs:\n"
-                    "\u25cf high (on), \u25cb low (off). A SetDO row switches them, with the arm at rest.",
+                    "\u25cf high (on), \u25cb low (off). A SetDO / SetToolDO row switches them, with the arm at rest.",
                  6: "Measured after a run: min / mean / max TCP speed (mm/s) along the command.\n"
                     "Red: the mean is outside the band round the reference. Select a row to see its stretch "
                     "of the speed graph.",
