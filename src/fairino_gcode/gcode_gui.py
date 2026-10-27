@@ -300,14 +300,21 @@ class PlanCanvas(FigureCanvasQTAgg):
             self._trail.clear()
         else:
             self._tcp = np.asarray(xyz[:3], dtype=float)
-            if not self._trail or np.linalg.norm(self._trail[-1] - self._tcp) >= TRAIL_STEP_MM:
-                self._trail.append(self._tcp)
+            self.add_trail(self._tcp)
         self._place_tcp()
         if first and np.any(np.abs(self._tcp - self._centre) > self._half):
             self.refit()                           # the robot is outside the picture: zoom out once
             self._redraw()
         else:
             self._paint_live()
+
+    def add_trail(self, xyz):
+        """Add a TCP position to the trail without drawing it. Every status sample comes through here, not
+        only the newest one at each redraw: drawing the 3D view can take longer than the time between two
+        samples, and a trail of only the drawn ones turns a fast circle into a polygon."""
+        p = np.asarray(xyz[:3], dtype=float)
+        if not self._trail or np.linalg.norm(self._trail[-1] - p) >= TRAIL_STEP_MM:
+            self._trail.append(p)
 
     def set_tcp_live(self, live: bool):
         """Grey the TCP out (no fresh data) or colour it again."""
@@ -771,7 +778,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._sim_port is None:
             self._sim_port = free_udp_port()
             self.simulator.serve_status(self._sim_port)
-        monitor = RobotMonitor(Target("127.0.0.1", port=self._sim_port))
+        # a local stream costs nothing: 50 samples a second, for a smooth trail and speed graph
+        monitor = RobotMonitor(Target("127.0.0.1", port=self._sim_port, period_ms=20))
         monitor.start()
         self.attach_monitor(monitor)
 
@@ -964,8 +972,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_sample(self, sample: dict):
         if self.monitor is not None:               # late frames after a disconnect are dropped
-            self._sample = sample                  # the 3D view and the panel show only the newest...
-            self.speed.add_sample(sample)          # ...the speed graph keeps every one
+            self._sample = sample                  # the TCP marker and the panel show only the newest...
+            self.speed.add_sample(sample)          # ...the speed graph keeps every one...
+            if TCP in sample:
+                self.canvas.add_trail(sample[TCP])     # ...and so does the trail (drawn with the next redraw)
 
     def _show_live(self):
         self._show_running()

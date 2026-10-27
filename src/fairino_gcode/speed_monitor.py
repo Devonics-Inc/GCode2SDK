@@ -40,7 +40,7 @@ from . import gcode_to_fairino as eng
 
 TCP = "actual_TCP_pos"          # status item: [x, y, z, rx, ry, rz] (same name as robot_monitor.TCP)
 SPEED = "actual_TCP_cmpvel"     # status item: [TCP speed mm/s, ...]
-RECEIVED = "_received"          # added by robot_monitor.py: time.monotonic() when the frame arrived
+RECEIVED = "_received"          # added by robot_monitor.py: time.monotonic() when the frame was sent
 MOVING_MM_S = 1.0               # slower than this = standing still (status noise is ~0.2 mm/s)
 DIFF_WINDOW_S = 0.2             # speed from positions: over at least this much time
 # Standstill filter. A robot at rest reports a TCP speed that jitters between 0 and ~1 mm/s while its

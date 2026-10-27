@@ -575,3 +575,23 @@ def test_report_is_one_line_per_gcode_line_and_covers_the_whole_path(tmp_path):
     assert len(lines) == 2 and "line 3  G1 X400 Y250 F600" in lines[0] and "line 5" in lines[1]
     assert "out of reach in this posture" in lines[0] and " of 32 points from " in lines[0]
     assert not any("would have to turn" in text for text in logged)   # no false joint jump after the gap
+
+
+def test_the_trail_keeps_every_sample_even_when_redraws_are_slower(qapp):
+    """A fast circle: samples ~4 mm apart, but the 3D view redraws only now and then. Every sample must be in
+    the trail, or the circle is drawn as a polygon of the redrawn ones."""
+    win = gcode_gui.MainWindow(settings())
+    win.show()
+    win.monitor = object()                                   # samples are taken while a robot is attached
+    centre, radius = np.array([300.0, -200.0, 400.0]), 20.0
+    points = [centre + radius * np.array([np.cos(a), np.sin(a), 0.0]) for a in np.linspace(0, 2 * np.pi, 33)[:-1]]
+    for k, p in enumerate(points):
+        win._on_sample({gcode_gui.TCP: list(p)})
+        if k % 8 == 0:                                       # a redraw only after every 8th sample
+            win._show_live()
+    win._show_live()
+    trail = np.array(win.canvas._trail)
+    assert len(trail) == len(points)
+    assert np.allclose(np.linalg.norm(trail - centre, axis=1), radius)
+    win.monitor = None
+    win.close()
