@@ -14,9 +14,19 @@ Supported G-code:
                      controller refuses, is sent as short MoveL segments instead)
     G4 P/S           dwell
     G17 G20 G21 G90 G91
-    M3/M4/M5         spindle/laser/pen on/off -> control-box DO (--spindle-do)
+    M3/M4/M5         spindle/laser/pen on/off -> control-box output (--spindle-do)
     M0/M1            pause (press Enter)   M2/M30 end of program
 Anything else is reported as a warning and ignored.
+
+Control-box outputs are numbered as SetDO numbers them: 0-7 = DO0-DO7 (digital outputs), 8-15 = CO0-CO7
+(configurable outputs); output_name() gives the name.
+
+Per-line outputs (the GUI's "Per line" setup, add_outputs()): up to 3 control-box outputs, each set high or low
+for every G-code line. Where a state changes, the arm stops at the start of that line and SetDO is sent,
+so the output switches exactly there. Outside the lines - during the approach and the retract move, after
+the job ends, and when it is stopped or fails - each output takes its default state (rest_states()).
+Per-line delays (same tab, add_delays()): a line can wait a number of ms before it starts - after its
+outputs have switched - with the arm at rest.
 
 Speed: every move runs at one speed, --global-speed % of the robot's full speed (the controller's
 global speed, like the WebApp speed slider). F and S words in the file are ignored.
@@ -60,7 +70,7 @@ MOTION_KINDS = ("line", "arc", "circle")
 # ============================================================================ parsing
 @dataclass
 class Cmd:
-    kind: str                     # "line", "arc", "circle", "dwell", "m"
+    kind: str                     # "line", "arc", "circle", "dwell", "m", "do"
     line: int                     # source line number (for error messages)
     start: Tuple[float, ...] = None
     end: Tuple[float, ...] = None
@@ -73,6 +83,8 @@ class Cmd:
     src: str = ""                 # the G-code text this came from (for the trace)
     spindle: float = 0.0          # S word in effect; the WebApp uses it as the G0 speed (mm/min)
     arc: Tuple[float, ...] = None  # arc/circle: (cx, cy, radius, start angle, signed sweep), rad
+    outputs: list = None          # "do": [(control-box DO number, high), ...] to set - see add_outputs()
+    added: str = ""               # "delay": a wait the per-line setup added, not one from the file
     instr: str = ""               # robot instruction this becomes - filled in by plan()
     poses: list = None            # robot target poses - filled in by plan()
 
@@ -322,6 +334,71 @@ def limit_arcs(cmds, scale=1.0, min_gap=MIN_ARC_GAP, tol=ARC_TOL):
     return out, notes
 
 
+def output_name(pin) -> str:
+    """The name of a control-box output from its SetDO number: 0-7 -> DO0-DO7, 8-15 -> CO0-CO7."""
+    pin = int(pin)
+    return f"DO{pin}" if pin < 8 else f"CO{pin - 8}"
+
+
+def set_do_text(pin, on) -> str:
+    """One SetDO as the trace and the command list show it: "SetDO(8, 1) CO0 high"."""
+    return f"SetDO({int(pin)}, {int(on)}) {output_name(pin)} {'high' if on else 'low'}"
+
+
+def add_outputs(cmds, pins, high):
+    """Per-line digital outputs. pins: control-box DO numbers (at most 3); high: {G-code line: [high?, ...]}
+    in the order of pins (a line that is not in it: all low). Puts a "do" command before the first command
+    of every G-code line whose states differ from the line before, and one before the very first command,
+    which sets them all. A "do" command is not a move, so the arm stops there (as for M3 / M5) and the
+    output switches exactly where its line begins."""
+    pins = [int(p) for p in pins or ()]
+    if not pins:
+        return cmds
+    out, state = [], None
+    for c in cmds:
+        want = tuple(bool(v) for v in (list((high or {}).get(c.line, ())) + [False] * len(pins))[:len(pins)])
+        if want != state:
+            changes = [(p, w) for k, (p, w) in enumerate(zip(pins, want)) if state is None or state[k] != w]
+            out.append(Cmd("do", c.line, src=c.src, outputs=changes))
+            state = want
+        out.append(c)
+    return out
+
+
+def add_delays(cmds, delays):
+    """Per-line delays. delays: {G-code line: ms}. Puts a wait before the first command of every such line
+    (after the "do" command that switches its outputs, if any). A wait is not a move, so the arm is at rest
+    for it."""
+    delays = {int(n): int(ms) for n, ms in (delays or {}).items() if int(ms) > 0}
+    if not delays:
+        return cmds
+    out, done = [], set()
+    for c in cmds:
+        if c.kind != "do" and c.line in delays and c.line not in done:
+            out.append(Cmd("dwell", c.line, seconds=delays[c.line] / 1000.0, src=c.src, added="delay"))
+            done.add(c.line)
+        out.append(c)
+    return out
+
+
+def rest_states(a):
+    """[(DO, high), ...]: every per-line output with its state outside the G-code lines (default low)."""
+    pins = [int(p) for p in getattr(a, "outputs", None) or ()]
+    rest = list(getattr(a, "output_defaults", None) or ())
+    return [(p, bool(rest[k]) if k < len(rest) else False) for k, p in enumerate(pins)]
+
+
+def output_states(cmds):
+    """{command index: ((DO, high), ...)}: the state of every per-line output while each command runs."""
+    state, out = {}, {}
+    for k, c in enumerate(cmds):
+        if c.kind == "do":
+            state.update(c.outputs)
+        if state:
+            out[k] = tuple(state.items())
+    return out
+
+
 def motion_length(c, scale=1.0):
     """Path length of a motion in robot mm."""
     seq = polyline(c)
@@ -414,6 +491,8 @@ def speed_text(c, a) -> str:
 def describe(c, a, note=""):
     """One trace line: the G-code that was read -> the robot command it is implemented as."""
     head = f"N{c.line:<5d} {c.src[:32]:<32} -> "
+    if c.kind == "dwell" and c.added:
+        return head + f"wait {round(c.seconds * 1000)} ms (per-line delay)"
     if c.kind == "dwell":
         return head + f"wait {c.seconds:g} s"
     if c.kind == "m":
@@ -421,7 +500,9 @@ def describe(c, a, note=""):
             return head + "pause until Enter"
         if a.spindle_do < 0:
             return head + f"M{c.code} skipped (no --spindle-do)"
-        return head + f"SetDO({a.spindle_do}, {0 if c.code == 5 else 1})"
+        return head + set_do_text(a.spindle_do, c.code != 5)
+    if c.kind == "do":
+        return head + ", ".join(set_do_text(pin, on) for pin, on in c.outputs)
 
     def fmt(p):
         return "[" + ", ".join(f"{round(v, 3) + 0.0:.3f}" for v in p) + "]"
@@ -447,6 +528,8 @@ def summarize(cmds, frame, a, follow, out=print):
     if not pts:
         out("No motion found in file.")
         return None
+    switches = [c for c in cmds if c.kind == "do"]
+    delays = [c for c in cmds if c.kind == "dwell" and c.added]
     lo = [min(p[i] for p in pts) for i in range(3)]
     hi = [max(p[i] for p in pts) for i in range(3)]
     where = f"workpiece {a.user}" if a.user else "BASE"
@@ -470,6 +553,15 @@ def summarize(cmds, frame, a, follow, out=print):
             f"MoveJ at {a.global_speed} % (F / S in the file are ignored)")
     else:
         out(f"Speed           : {a.global_speed} % of full speed for every move (F / S in the file are ignored)")
+    if switches:
+        rest = dict(rest_states(a))
+        pins = ", ".join(f"{output_name(p)} ({'high' if rest.get(p) else 'low'} outside the lines)"
+                         for p, _on in switches[0].outputs)
+        out(f"Outputs         : {pins} set per G-code line; {len(switches) - 1} change(s) after the start, "
+            "the arm stops at each")
+    if delays:
+        out(f"Line delays     : {len(delays)} line(s) wait before they start, "
+            f"{sum(c.seconds for c in delays):g} s in all")
     out(f"Path length     : {length:.1f} mm   (est. {seconds / 60:.1f} min)")
     out(f"Frame bbox      : X {lo[0]:.1f}..{hi[0]:.1f}  Y {lo[1]:.1f}..{hi[1]:.1f}  Z {lo[2]:.1f}..{hi[2]:.1f} mm")
     return lo, hi
@@ -606,6 +698,7 @@ class Streamer:
         self.last_pose = None     # where the previous instruction leaves the TCP
         self.sent, self.total = 0, 0
         self.spindle_on = False
+        self.outputs_live = False # per-line outputs were switched by this run (a stop puts them back)
         self.unreachable = []     # (cmd, pose) pairs found by check_ik()
         # Hooks. The defaults are the command-line behaviour; a GUI replaces them.
         self.on_command = None    # called as on_command(cmd, text) instead of printing the trace
@@ -785,6 +878,20 @@ class Streamer:
             self.pause(f"[line {c.line}] M{c.code} pause - press Enter to continue...")
             self.check_abort()
 
+    def set_outputs(self, c):
+        """A "do" command: switch the per-line outputs, with the arm at rest at the start of the line."""
+        self.wait_idle()
+        self.trace(c)
+        for pin, on in c.outputs:
+            self.check(self.robot.SetDO(pin, int(on)), "SetDO", c.line)
+        self.outputs_live = True
+
+    def rest_outputs(self, call=None):
+        """Every per-line output to its state outside the lines (approach, end of the job, a stop)."""
+        for pin, on in rest_states(self.a):
+            (call or (lambda f: f()))(lambda pin=pin, on=on: self.robot.SetDO(pin, int(on)))
+        self.outputs_live = True
+
     # ---- top level
     def check_points(self, c, start):
         """The poses to test for one motion, in path order, as (pose, on_path).
@@ -894,6 +1001,10 @@ class Streamer:
         if servo(self.a):                         # every joint position of the fixed-speed paths, before moving
             self.plan_servo(cmds, hop(first.poses[-1], first.line, "").poses[0] if lift > 0 else None)
         if lift > 0:
+            if any(c.kind == "do" for c in cmds):   # the approach is outside the lines: outputs at rest
+                self.rest_outputs()
+                self.log("  outputs at their state outside the lines for the approach: " + ", ".join(
+                    f"{output_name(p)} {'high' if on else 'low'}" for p, on in rest_states(self.a)))
             self.send(hop(first.poses[-1], first.line, "(approach)"))
 
         t0 = time.time()
@@ -916,6 +1027,10 @@ class Streamer:
         if self.spindle_on:
             self.robot.SetDO(self.a.spindle_do, 0)
             self.spindle_on = False
+        if self.outputs_live:
+            self.rest_outputs()
+            self.log("  outputs back to their state outside the lines: "
+                     + ", ".join(f"{output_name(p)} {'high' if on else 'low'}" for p, on in rest_states(self.a)))
         if lift > 0 and self.last_pose is not None:
             self.send(hop(self.last_pose, motions[-1].line, "(retract)"))
         self.log(f"Done in {time.time() - t0:.1f}s")
@@ -1130,9 +1245,12 @@ class Streamer:
                 raise Aborted("Stopped by the operator.")
         elif c.kind == "m":
             self.m_code(c)
+        elif c.kind == "do":
+            self.set_outputs(c)
 
     def emergency_stop(self):
-        """Stop the arm, then switch the tool output off. Call it on the thread that talks to the robot."""
+        """Stop the arm, then switch the tool output and the per-line outputs off. Call it on the thread that
+        talks to the robot."""
         self.abort.set()
 
         def twice(call):                     # after Ctrl-C the connection is left in the middle of a
@@ -1149,9 +1267,13 @@ class Streamer:
                     pass
             twice(self.robot.StopMotion)
         finally:
-            if self.spindle_on and self.a.spindle_do >= 0:
-                twice(lambda: self.robot.SetDO(self.a.spindle_do, 0))
-                self.spindle_on = False
+            try:
+                if self.spindle_on and self.a.spindle_do >= 0:
+                    twice(lambda: self.robot.SetDO(self.a.spindle_do, 0))
+                    self.spindle_on = False
+            finally:
+                if self.outputs_live:
+                    self.rest_outputs(twice)
 
 
 # ============================================================================ CLI
@@ -1214,7 +1336,8 @@ def build_parser():
     p.add_argument("--approach", type=float, default=None,
                    help="approach/retract height mm; default 0 (none) with --ref-point, else 20")
     p.add_argument("--quiet", action="store_true", help="do not print the command-by-command trace")
-    p.add_argument("--spindle-do", type=int, default=-1, help="control-box DO for M3/M5 (-1 = off)")
+    p.add_argument("--spindle-do", type=int, default=-1,
+                   help="control-box output for M3/M5: 0-7 = DO0-DO7, 8-15 = CO0-CO7 (-1 = none)")
     p.add_argument("--dwell-ms", action="store_true", help="treat G4 P as milliseconds (Marlin)")
     p.add_argument("--min-z", type=float, default=None, help="refuse to run if any base Z is below this")
     p.add_argument("--dry-run", action="store_true", help="parse and summarize only, no motion")

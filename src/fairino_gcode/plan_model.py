@@ -27,6 +27,7 @@ class Plan:
     paths: Dict[int, np.ndarray] = field(default_factory=dict)   # command index -> (N, 3) TCP points
     placed: bool = False                           # True: positioned with the robot (real coordinates)
     unreachable: List[list] = field(default_factory=list)        # XYZ of targets the robot cannot reach
+    outputs: Dict[int, tuple] = field(default_factory=dict)      # command index -> ((DO, high), ...) while it runs
 
     @property
     def motions(self) -> List[int]:
@@ -57,10 +58,14 @@ def build_plan(path: str, settings: argparse.Namespace, frame: Optional[eng.Fram
     cmds, notes = eng.limit_arcs(cmds, frame.scale, getattr(settings, "min_arc_gap", eng.MIN_ARC_GAP),
                                  getattr(settings, "arc_tol", eng.ARC_TOL))
     warnings += notes
+    # per-line digital outputs (RunSetup "Per line"): a SetDO step wherever a line changes them
+    cmds = eng.add_outputs(cmds, getattr(settings, "outputs", None), getattr(settings, "output_lines", None))
+    cmds = eng.add_delays(cmds, getattr(settings, "line_delays", None))      # ...and the per-line waits
     follow = eng.plan(cmds, frame, settings)
     summary: List[str] = []
     bbox = eng.summarize(cmds, frame, settings, follow, out=summary.append)
-    plan = Plan(path, settings, cmds, warnings, frame, follow, summary, bbox, placed=placed)
+    plan = Plan(path, settings, cmds, warnings, frame, follow, summary, bbox, placed=placed,
+                outputs=eng.output_states(cmds))
     first = True
     for k, c in enumerate(cmds):
         if c.kind not in eng.MOTION_KINDS:

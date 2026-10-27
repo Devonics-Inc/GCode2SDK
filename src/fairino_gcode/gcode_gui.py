@@ -70,9 +70,10 @@ from .export_script import default_name, export_plan  # noqa: E402
 from .plan_model import Plan, build_plan, default_settings  # noqa: E402
 from .robot_monitor import DEFAULT_IP, TCP, RobotMonitor, Target  # noqa: E402
 from .robot_widgets import ConnectDialog, RobotStatusPanel, _settings  # noqa: E402
-from .run_control import AUTO, HERE, MANUAL, Job, JobResult, RobotSession, RunSetup, RunSetupDialog  # noqa: E402
+from .run_control import (AUTO, HERE, MANUAL, Job, JobResult, RobotSession, RunSetup, RunSetupDialog,  # noqa: E402
+                          speed_summary)
 from .speed_monitor import CommandSpeed, TargetSpeed  # noqa: E402
-from .speed_view import SpeedView  # noqa: E402
+from .speed_view import BAND_PCT, SpeedView  # noqa: E402
 
 Qt = QtCore.Qt
 
@@ -357,14 +358,18 @@ class PlanCanvas(FigureCanvasQTAgg):
 
 
 # ============================================================================ command list
+OUTPUT_COLOR = "#7b3fb3"                       # rows the "Per line" setup added: SetDO and waits
+
 class CommandTable(QtCore.QAbstractTableModel):
     """One row per command of the plan: what the G-code said and what the robot will be told."""
-    HEAD = ["#", "Line", "G-code", "Robot command", "Speed", "In move", "At target"]
-    HEAD_TIPS = {5: "Measured after a run: min / mean / max TCP speed (mm/s) along the command.\n"
+    HEAD = ["#", "Line", "G-code", "Robot command", "Outputs", "Speed", "In move", "At target"]
+    HEAD_TIPS = {4: "Per-line digital outputs (Set up run > Per line) while this command runs:\n"
+                    "\u25cf high (on), \u25cb low (off). A SetDO row switches them, with the arm at rest.",
+                 6: "Measured after a run: min / mean / max TCP speed (mm/s) along the command.\n"
                     "Red: the mean is outside the band round the reference. Select a row to see its stretch "
                     "of the speed graph.",
-                 6: "Measured after a run: TCP speed (mm/s) through the command's end point."}
-    SPEED_COL, MOVE_COL, TARGET_COL = 4, 5, 6
+                 7: "Measured after a run: TCP speed (mm/s) through the command's end point."}
+    OUT_COL, SPEED_COL, MOVE_COL, TARGET_COL = 4, 5, 6, 7
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -372,7 +377,7 @@ class CommandTable(QtCore.QAbstractTableModel):
         self._targets: Dict[int, TargetSpeed] = {}     # measured after a run (speed_view.SpeedView)
         self._commands: Dict[int, CommandSpeed] = {}   # measured after a run: the speed along each command
         self._reference: Optional[float] = None
-        self._tolerance = 10.0
+        self._tolerance = BAND_PCT
 
     def set_plan(self, plan: Optional[Plan]):
         self.beginResetModel()
@@ -409,6 +414,14 @@ class CommandTable(QtCore.QAbstractTableModel):
             return "stop"                          # the arm halts there on purpose: no speed to judge
         return f"{t.speed:.1f} mm/s" + ("" if t.deviation is None else f"  {t.deviation:+.0f} %")
 
+    def outputs_text(self, row: int, long: bool = False) -> Optional[str]:
+        states = self._plan.outputs.get(row) if self._plan is not None else None
+        if not states:
+            return None
+        if long:
+            return ", ".join(f"{eng.output_name(pin)} {'high' if on else 'low'}" for pin, on in states)
+        return "  ".join(f"{eng.output_name(pin)} {chr(0x25CF) if on else chr(0x25CB)}" for pin, on in states)
+
     def rowCount(self, parent=QtCore.QModelIndex()):
         return 0 if parent.isValid() or self._plan is None else len(self._plan.cmds)
 
@@ -436,6 +449,8 @@ class CommandTable(QtCore.QAbstractTableModel):
                 return c.src
             if col == 3:
                 return c.instr if motion else self.describe(index.row()).split(" -> ", 1)[1]
+            if col == self.OUT_COL:
+                return self.outputs_text(index.row())
             if motion and col == self.SPEED_COL:
                 return eng.speed_text(c, self._plan.settings)
             if col == self.MOVE_COL:
@@ -443,10 +458,17 @@ class CommandTable(QtCore.QAbstractTableModel):
             if col == self.TARGET_COL:
                 return self.target_text(index.row())
             return None
-        if role == Qt.ItemDataRole.TextAlignmentRole and col not in (2, 3):
+        if role == Qt.ItemDataRole.TextAlignmentRole and col not in (2, 3, self.OUT_COL):
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         if role == Qt.ItemDataRole.ForegroundRole and col == 3 and motion:
             return QtGui.QBrush(QtGui.QColor(STYLES[style_key(c)]["color"]))
+        added = c.kind == "do" or bool(c.added)                    # steps the "Per line" setup added
+        if role == Qt.ItemDataRole.ForegroundRole and col in (3, self.OUT_COL) and added:
+            return QtGui.QBrush(QtGui.QColor(OUTPUT_COLOR))          # where the outputs switch, line delays
+        if role == Qt.ItemDataRole.FontRole and col in (3, self.OUT_COL) and added:
+            font = QtGui.QFont()
+            font.setBold(True)
+            return font
         if role == Qt.ItemDataRole.ForegroundRole and col == self.TARGET_COL and index.row() in self._targets:
             t = self._targets[index.row()]
             if t.stop:
@@ -457,6 +479,8 @@ class CommandTable(QtCore.QAbstractTableModel):
         if role == Qt.ItemDataRole.ForegroundRole and col == self.MOVE_COL and self._off_speed(index.row()):
             return QtGui.QBrush(QtGui.QColor("#d62728"))
         if role == Qt.ItemDataRole.ToolTipRole:
+            if col == self.OUT_COL and self.outputs_text(index.row()):
+                return self.outputs_text(index.row(), long=True)
             if col == self.MOVE_COL and index.row() in self._commands:
                 s = self._commands[index.row()]
                 return (f"TCP speed along this command ({s.samples} samples, {s.seconds:.2f} s, "
@@ -489,6 +513,35 @@ DEMO_FILE = os.path.join(HERE_DIR, "samples", "demo_part.gcode")
 ICON_FILE = os.path.join(HERE_DIR, "resources", "icon.png")
 BANNER = {"info": ("#eef2f7", "#374151"), "good": ("#e6f4ea", "#137333"), "bad": ("#fdecea", "#b3261e"),
           "busy": ("#fff4e5", "#8a4b00")}
+
+
+def gcode_lines(plan: Optional[Plan]):
+    """[(line number, G-code text, robot command, colour or None), ...]: the lines of the file that make the
+    robot do something, in order - the rows of the dialog's "Per line" tab. The robot command is what the
+    line becomes ("MoveC", "MoveL x12" for an arc sent as short lines, "wait 0.5 s"), coloured as in the
+    command list."""
+    if plan is None:
+        return []
+    by_line: Dict[int, list] = {}
+    for c in plan.cmds:
+        if c.kind != "do" and not c.added:          # not what the per-line setup itself added
+            by_line.setdefault(c.line, []).append(c)
+    out = []
+    for n, cmds in by_line.items():
+        parts, colour = [], None
+        for c in cmds:
+            if c.kind in eng.MOTION_KINDS:
+                text = c.instr
+                colour = colour or STYLES[style_key(c)]["color"]
+            else:
+                text = eng.describe(c, plan.settings).split(" -> ", 1)[1]
+            if parts and parts[-1][0] == text:
+                parts[-1][1] += 1
+            else:
+                parts.append([text, 1])
+        command = ", ".join(text if count == 1 else f"{text} \u00d7{count}" for text, count in parts)
+        out.append((n, cmds[0].src, command, colour))
+    return out
 
 
 def free_udp_port() -> int:
@@ -544,7 +597,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log.setPlaceholderText("Checks and runs are logged here: every command as it is sent.")
         self.speed = SpeedView()
         self.speed.targets_changed.connect(
-            lambda found: self.table_model.set_targets(found, self.speed.tolerance.value()))
+            lambda found: self.table_model.set_targets(found, self.speed.band))
         self.speed.commands_changed.connect(self._on_command_speeds)
         self.tabs = QtWidgets.QTabWidget()
         self.tabs.addTab(self.summary, "Summary")
@@ -760,7 +813,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def setup_run(self):
         if self.plan is None or self.session is None or self.job is not None:
             return
-        dialog = RunSetupDialog(self.setup, self)
+        dialog = RunSetupDialog(self.setup, self, gcode_lines(self.plan))
         dialog.exec()
         if dialog.chosen is not None:
             self.apply_setup(dialog.chosen)
@@ -799,7 +852,7 @@ class MainWindow(QtWidgets.QMainWindow):
             f"{os.path.basename(self.checked.path)}: {len(self.checked.motions)} moves on "
             f"{'the SIMULATED robot' if self.simulator is not None else self.session.ip}\n"
             f"Tool {self.checked.settings.tool}, workpiece {self.checked.settings.user}, "
-            f"speed {self.checked.settings.global_speed} % for every move\n\n"
+            f"Speed: {speed_summary(self.checked.settings)}\n\n"
             "Make sure the work area is clear and the emergency stop is within reach.")
         start = box.addButton("Start", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
         box.setDefaultButton(box.addButton(QtWidgets.QMessageBox.StandardButton.Cancel))
@@ -885,7 +938,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if result.plan is not None:
                 self._show_plan(result.plan)       # again: now with the unreachable targets marked
                 if self.setup.placement in (HERE, AUTO):   # keep this origin; do not read the TCP again
-                    self.setup = replace(self.setup, placement=MANUAL, origin=list(result.plan.frame.origin),
+                    self.setup = replace(self.setup, placement=MANUAL, placed_by=self.setup.placement,
+                                         origin=list(result.plan.frame.origin),
                                          rpy=list(result.plan.frame.rpy), tool=result.settings.tool,
                                          user=result.settings.user, yaw=result.settings.yaw, tool_down=False)
             self.checked = result.plan if result.ok else None
@@ -959,6 +1013,9 @@ class MainWindow(QtWidgets.QMainWindow):
         except (OSError, ValueError) as e:
             QtWidgets.QMessageBox.critical(self, "Cannot load G-code", f"{os.path.basename(path)}\n\n{e}")
             return False
+        if self.plan is None or os.path.abspath(path) != os.path.abspath(self.plan.path):
+            # per-line outputs and delays belong to the lines of one file: a different file starts with none
+            self.setup = replace(self.setup, output_lines={}, line_delays={})
         self.checked = None                        # a different file has to be checked again
         self._show_plan(plan)
         self.tabs.setCurrentWidget(self.summary)
@@ -979,6 +1036,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.table.resizeColumnsToContents()
         for col in (2, 3):                         # long G-code lines must not push the numbers out of sight
             self.table.setColumnWidth(col, min(self.table.columnWidth(col), 260))
+        self.table.setColumnHidden(CommandTable.OUT_COL, not plan.outputs)   # only with per-line outputs
         self.canvas.show_plan(plan)
         text = list(plan.summary)
         if plan.warnings:
@@ -997,8 +1055,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_command_speeds(self, found):
         """The speed along every command was measured (after a run) or cleared."""
-        reference = self.speed.recorder.reference(self.speed.custom_reference())[0] if found else None
-        self.table_model.set_commands(found, reference, self.speed.tolerance.value())
+        reference = self.speed.recorder.reference()[0] if found else None
+        self.table_model.set_commands(found, reference, self.speed.band)
         if found:
             for col in (CommandTable.MOVE_COL, CommandTable.TARGET_COL):
                 self.table.resizeColumnToContents(col)

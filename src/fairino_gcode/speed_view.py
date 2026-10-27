@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """
 speed_view.py - the speed panel under the 3D view: the TCP speed as the robot reports it, against the speed
-it should hold. Numbers beside the graph on a wide window, above it on a narrow one.
+it should hold. Nothing to set: the reference is automatic and the band is fixed at +/- BAND_PCT %.
 
-    graph       speed (mm/s) over time; dashed line = reference, shaded = the +/- tolerance band,
-                red = moving outside the band; after a run, a dot where the TCP went through each target
-                (orange = blended corner, grey = an exact stop)
-    numbers     now, reference, mean +/- standard deviation, steadiness (std as % of the mean), share
-                of the moving time inside the band, min / max, how often it left the band, and one line
-                about the targets
-    controls    reference (automatic = the commanded TCP speed in mm/s mode, else the median while moving,
-                or typed in), tolerance, clear, export CSV
+    line        how much of the moving time the speed stayed inside the band, and the reference; Clear
+    graph       speed (mm/s) over time; dashed line = reference (the commanded TCP speed in mm/s mode, else
+                the median while moving), shaded = the band, red = moving outside it; after a run, a dot
+                where the TCP went through each target (orange = blended corner, grey = an exact stop)
     per command after a run, the speed along every command (speed_monitor.command_speeds); selecting a
                 row of the command table shades that command's time on the graph (highlight())
 
@@ -18,7 +14,6 @@ The numbers come from speed_monitor.py. Nothing here talks to the robot.
 """
 from __future__ import annotations
 
-import os
 import time
 from typing import Dict, List, Optional
 
@@ -28,13 +23,14 @@ from matplotlib.backends.qt_compat import QtCore, QtWidgets
 from matplotlib.figure import Figure
 
 from .speed_monitor import (RAPID, CommandSpeed, SpeedRecorder, SpeedStats, TargetSpeed, command_speeds,
-                            plan_targets, target_summary, write_command_csv, write_samples_csv)
+                            plan_targets, write_command_csv, write_samples_csv)
 
 Signal = getattr(QtCore, "Signal", None) or QtCore.pyqtSignal
 Qt = QtCore.Qt
 
 GREEN, AMBER, RED, GREY, BLUE, ORANGE = "#1a9850", "#e08a00", "#d62728", "#8a8f98", "#1f6fd0", "#e8710a"
 MAX_DRAWN = 6000                 # points drawn at most (the statistics always use all of them)
+BAND_PCT = 15.0                  # the speed counts as on target within +/- this % of the reference
 
 
 class SpeedView(QtWidgets.QWidget):
@@ -51,30 +47,18 @@ class SpeedView(QtWidgets.QWidget):
         self._dirty = True
         self._span = None                               # the shaded time of the selected command
 
-        # ---- numbers
-        self.values: Dict[str, QtWidgets.QLabel] = {}
-        self._cells = []                         # (caption, value) labels, put in the grid by _arrange()
-        self._grid = grid = QtWidgets.QGridLayout()
-        grid.setHorizontalSpacing(14)
-        grid.setVerticalSpacing(0)
-        cells = [("now", "Now"), ("ref", "Reference"), ("mean", "Mean ± std"), ("cv", "Steadiness"),
-                 ("within", "Inside band"), ("range", "Min / max"), ("left", "Left the band"),
-                 ("moving", "Moving time")]
-        for key, caption in cells:
-            head = QtWidgets.QLabel(caption)
-            head.setStyleSheet(f"color: {GREY};")
-            value = QtWidgets.QLabel("-")
-            value.setStyleSheet("font-weight: 600;")
-            value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            self._cells.append((head, value))
-            self.values[key] = value
-        self.values["cv"].setToolTip("Standard deviation as a % of the mean speed: 0 % = perfectly steady.")
-        self.values["within"].setToolTip("Share of the time spent moving with the speed inside the band.")
-        self.values["left"].setToolTip("How many times the speed went outside the band while moving "
-                                       "(corners, accelerating, slowing down for a stop).")
-        self.target_line = QtWidgets.QLabel("Targets: run the plan to see the speed at each target point.")
-        self.target_line.setWordWrap(True)
-        self.target_line.setStyleSheet(f"color: {GREY};")
+        self.band = BAND_PCT
+
+        # ---- one line above the graph: how steady, and Clear
+        self.status = QtWidgets.QLabel("Run the plan to see how steady the TCP speed is.")
+        self.status.setTextFormat(Qt.TextFormat.RichText)
+        self.status.setWordWrap(True)
+        self.clear_btn = QtWidgets.QPushButton("Clear")
+        self.clear_btn.setToolTip("Forget the recorded speeds (Start does this too).")
+        self.clear_btn.clicked.connect(self.clear)
+        top = QtWidgets.QHBoxLayout()
+        top.addWidget(self.status, 1)
+        top.addWidget(self.clear_btn)
 
         # ---- graph
         self.fig = Figure(figsize=(5, 2.2), constrained_layout=True)
@@ -97,8 +81,8 @@ class SpeedView(QtWidgets.QWidget):
         self.key = QtWidgets.QLabel(
             f'<span style="color:{BLUE}">━</span> speed &nbsp; '
             f'<span style="color:{RED}">━</span> outside the band &nbsp; '
-            '<span style="color:#444444">╌</span> reference &nbsp; '
-            f'<span style="color:{GREEN}">█</span> band &nbsp; '
+            f'<span style="color:#444444">╌</span> reference &nbsp; '
+            f'<span style="color:{GREEN}">█</span> ±{BAND_PCT:g} % band &nbsp; '
             f'<span style="color:{ORANGE}">●</span> through a target &nbsp; '
             f'<span style="color:{GREY}">▼</span> exact stop &nbsp; '
             f'<span style="color:{GREY}">━</span> G0 rapid (not counted)')
@@ -106,56 +90,13 @@ class SpeedView(QtWidgets.QWidget):
         self.key.setWordWrap(True)
         self.key.setStyleSheet("font-size: 8pt;")
 
-        # ---- controls
-        self.reference = QtWidgets.QDoubleSpinBox()
-        self.reference.setRange(0.0, 5000.0)
-        self.reference.setDecimals(1)
-        self.reference.setSingleStep(5.0)
-        self.reference.setSuffix(" mm/s")
-        self.reference.setSpecialValueText("auto")
-        self.reference.setMinimumWidth(110)
-        self.reference.setToolTip("The speed the TCP should hold. Auto: the commanded TCP speed when the job runs "
-                                  "in mm/s,\nelse the median of the speeds while moving.")
-        self.tolerance = QtWidgets.QDoubleSpinBox()
-        self.tolerance.setRange(1.0, 50.0)
-        self.tolerance.setDecimals(0)
-        self.tolerance.setValue(10.0)
-        self.tolerance.setPrefix("± ")
-        self.tolerance.setSuffix(" %")
-        self.clear_btn = QtWidgets.QPushButton("Clear")
-        self.clear_btn.setToolTip("Forget the recorded speeds (Start does this too).")
-        self.reference.valueChanged.connect(self._settings_changed)
-        self.tolerance.valueChanged.connect(self._settings_changed)
-        self.clear_btn.clicked.connect(self.clear)
-        self.export_btn = QtWidgets.QPushButton("Export CSV…")
-        self.export_btn.setToolTip("Save the speed of every command, and every recorded sample, as CSV files.")
-        self.export_btn.clicked.connect(self.export_dialog)
-        # one row above the graph, two short rows beside it (_arrange)
-        self._ref_label, self._band_label = QtWidgets.QLabel("Reference"), QtWidgets.QLabel("Band")
-        self._controls = controls = QtWidgets.QGridLayout()
-        controls.setContentsMargins(0, 0, 0, 0)
-
-        # numbers beside the graph when there is width for it (_arrange), above it when there is not
-        self.numbers_box = QtWidgets.QWidget()
-        nbox = QtWidgets.QVBoxLayout(self.numbers_box)
-        nbox.setContentsMargins(0, 0, 0, 0)
-        nbox.addLayout(controls)
-        nbox.addLayout(grid)
-        nbox.addWidget(self.target_line)
-        nbox.addStretch(1)
-        graph_box = QtWidgets.QWidget()
-        gbox = QtWidgets.QVBoxLayout(graph_box)
-        gbox.setContentsMargins(0, 0, 0, 0)
-        gbox.addWidget(self.canvas, 1)
-        gbox.addWidget(self.key)
-        # inside a scroll area: on a very small window it scrolls instead of squeezing things together
         content = QtWidgets.QWidget()
-        self._body = QtWidgets.QBoxLayout(QtWidgets.QBoxLayout.Direction.TopToBottom, content)
-        self._body.setContentsMargins(4, 4, 4, 4)
-        self._body.addWidget(self.numbers_box)
-        self._body.addWidget(graph_box, 1)
-        self._wide: Optional[bool] = None
-        self._arrange()
+        body = QtWidgets.QVBoxLayout(content)
+        body.setContentsMargins(4, 4, 4, 4)
+        body.addLayout(top)
+        body.addWidget(self.canvas, 1)
+        body.addWidget(self.key)
+        # inside a scroll area: on a very small window it scrolls instead of squeezing things together
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
@@ -166,15 +107,8 @@ class SpeedView(QtWidgets.QWidget):
 
         self._timer = QtCore.QTimer(self)        # samples arrive 20 times a second; 4 updates are plenty
         self._timer.setInterval(250)
-        self._timer.timeout.connect(self._tick)
+        self._timer.timeout.connect(self.refresh)
         self._timer.start()
-
-    def _tick(self):
-        # the layout follows the width here, not in a resizeEvent override: Qt can send resize events
-        # while it tears the window down, and Python code run then crashes (seen in the test suite).
-        # This timer belongs to the panel, so it stops with it.
-        self._arrange()
-        self.refresh()
 
     # ---- input
     def add_sample(self, sample: dict):
@@ -198,9 +132,6 @@ class SpeedView(QtWidgets.QWidget):
         self.recorder.commanded = speed or None
         self._dirty = True
 
-    def custom_reference(self) -> Optional[float]:
-        return self.reference.value() or None
-
     def analyse(self, plan):
         """Work out the speed through every target and along every command of `plan` (placed on the robot)
         from what was recorded."""
@@ -212,8 +143,8 @@ class SpeedView(QtWidgets.QWidget):
     def _commands_for(self, plan):
         if plan is None or not len(self.recorder):
             return {}, []
-        ref, _auto = self.recorder.reference(self.custom_reference())
-        return command_speeds(self.recorder, plan, ref, self.tolerance.value())
+        ref, _auto = self.recorder.reference()
+        return command_speeds(self.recorder, plan, ref, self.band)
 
     def _set_commands(self, found: Dict[int, CommandSpeed], owner):
         self.commands, self._owner = found, list(owner)
@@ -234,22 +165,6 @@ class SpeedView(QtWidgets.QWidget):
         self.canvas.draw_idle()
 
     # ---- export
-    def export_dialog(self):
-        if not len(self.recorder):
-            QtWidgets.QMessageBox.information(self, "Export speeds", "Nothing recorded yet.")
-            return
-        stem = os.path.splitext(self._plan.path)[0] if self._plan is not None else "speed"
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export speeds as CSV", stem + "_speed.csv",
-                                                        "CSV (*.csv)")
-        if not path:
-            return
-        try:
-            written = self.export(path)
-        except OSError as exc:
-            QtWidgets.QMessageBox.critical(self, "Export failed", str(exc))
-            return
-        QtWidgets.QMessageBox.information(self, "Export speeds", "Saved:\n" + "\n".join(written))
-
     def export(self, path: str) -> List[str]:
         """Write the speed per command to `path` (after a run) and every sample to <path>_samples.csv."""
         if not path.lower().endswith(".csv"):
@@ -272,59 +187,35 @@ class SpeedView(QtWidgets.QWidget):
     def _targets_for(self, plan) -> Dict[int, TargetSpeed]:
         if plan is None or not len(self.recorder):
             return {}
-        ref, _auto = self.recorder.reference(self.custom_reference())
+        ref, _auto = self.recorder.reference()
         return self.recorder.at_targets(plan_targets(plan), ref)
 
     def _set_targets(self, found: Dict[int, TargetSpeed], plan):
         self.targets, self._plan = found, plan
-        if plan is None:
-            self.target_line.setText("Targets: run the plan to see the speed at each target point.")
-        else:
-            self.target_line.setText("Targets: " + target_summary(found, len(plan.motions), self.tolerance.value()))
         self.targets_changed.emit(found)
-
-    def _settings_changed(self, _value=None):
-        if self._plan is not None:
-            self._set_targets(self._targets_for(self._plan), self._plan)
-            self._set_commands(*self._commands_for(self._plan))
-        self._dirty = True
-        self.refresh()
 
     # ---- output
     def stats(self) -> SpeedStats:
-        return self.recorder.stats(self.custom_reference(), self.tolerance.value())
+        return self.recorder.stats(None, self.band)
 
     def refresh(self):
         """Numbers and graph, only while someone can see them (the samples are kept either way)."""
         if not self._dirty or not self.isVisible():
             return
         s = self.stats()
-        self._show_numbers(s)
+        self._show_status(s)
         self._draw(s)
         self._dirty = False
         # a long recording costs more to summarise: then once a second is enough
         self._timer.setInterval(250 if len(self.recorder) < 20000 else 1000)
 
-    def _show_numbers(self, s: SpeedStats):
-        def mm_s(v):
-            return "-" if v is None else f"{v:.1f} mm/s"
-
-        v = self.values
-        v["now"].setText(mm_s(s.now))
-        v["ref"].setText("-" if s.reference is None else f"{s.reference:.1f} mm/s"
-                         + {"median": " (median)", "commanded": " (commanded)"}.get(s.source, ""))
-        v["mean"].setText("-" if s.mean is None else f"{s.mean:.1f} ± {s.std:.1f} mm/s")
-        v["cv"].setText("-" if s.cv is None else f"{s.cv:.1f} %")
-        v["range"].setText("-" if s.low is None else f"{s.low:.1f} / {s.high:.1f}")
-        v["left"].setText(str(s.excursions) if s.within is not None else "-")
-        v["moving"].setText(f"{s.moving_s:.1f} s")
-        if s.within is None:
-            v["within"].setText("-")
-            v["within"].setStyleSheet("font-weight: 600;")
-        else:
-            colour = GREEN if s.within >= 90 else AMBER if s.within >= 70 else RED
-            v["within"].setText(f"{s.within:.0f} % (±{s.tolerance:g} %)")
-            v["within"].setStyleSheet(f"font-weight: 600; color: {colour};")
+    def _show_status(self, s: SpeedStats):
+        if s.within is None or s.reference is None:
+            self.status.setText("Run the plan to see how steady the TCP speed is.")
+            return
+        colour = GREEN if s.within >= 90 else AMBER if s.within >= 70 else RED
+        self.status.setText(f'<b style="color:{colour}">{s.within:.0f} %</b> of the moving time within '
+                            f"±{s.tolerance:g} % of {s.reference:.1f} mm/s")
 
     def _draw(self, s: SpeedStats):
         t, v = np.asarray(self.recorder.t, dtype=float), np.asarray(self.recorder.v, dtype=float)
@@ -356,47 +247,6 @@ class SpeedView(QtWidgets.QWidget):
         self.ax.set_xlim(0.0, max(1.0, float(td[-1]) if len(td) else 1.0))
         self.ax.set_ylim(0.0, top * 1.08)
         self.canvas.draw_idle()
-
-    # ---- layout: follows the space the panel gets
-    WIDE = 480                                   # px from which the numbers go beside the graph
-
-    def _arrange(self):
-        wide = self.width() >= self.WIDE
-        if wide:                                 # the graph keeps at least about half the width
-            self.numbers_box.setMaximumWidth(max(220, min(320, int(self.width() * 0.45))))
-        if wide == self._wide:
-            return
-        self._wide = wide
-        cols = 2 if wide else 4                  # beside the graph: a narrow column of numbers
-        for head, value in self._cells:
-            self._grid.removeWidget(head)
-            self._grid.removeWidget(value)
-        for n, (head, value) in enumerate(self._cells):
-            row, col = divmod(n, cols)
-            self._grid.addWidget(head, 2 * row, col)
-            self._grid.addWidget(value, 2 * row + 1, col)
-        c = self._controls
-        for w in (self._ref_label, self.reference, self._band_label, self.tolerance, self.clear_btn,
-                  self.export_btn):
-            c.removeWidget(w)
-        if wide:                                 # Reference [ ]  /  Band [ ] Clear  /  Export CSV
-            c.addWidget(self._ref_label, 0, 0)
-            c.addWidget(self.reference, 0, 1, 1, 2)
-            c.addWidget(self._band_label, 1, 0)
-            c.addWidget(self.tolerance, 1, 1)
-            c.addWidget(self.clear_btn, 1, 2)
-            c.addWidget(self.export_btn, 2, 1, 1, 2)
-        else:                                    # Reference [ ]  Band [ ]       Clear  Export CSV
-            for col, w in enumerate((self._ref_label, self.reference, self._band_label, self.tolerance)):
-                c.addWidget(w, 0, col)
-            c.addWidget(self.clear_btn, 0, 5)
-            c.addWidget(self.export_btn, 0, 6)
-        for col in range(7):
-            c.setColumnStretch(col, 1 if (col == 4 and not wide) else 0)
-        self._body.setDirection(QtWidgets.QBoxLayout.Direction.LeftToRight if wide
-                                else QtWidgets.QBoxLayout.Direction.TopToBottom)
-        if not wide:
-            self.numbers_box.setMaximumWidth(16777215)
 
     def showEvent(self, event):
         super().showEvent(event)

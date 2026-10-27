@@ -235,7 +235,8 @@ def test_the_command_line_refuses_export_in_servo_mode(tmp_path, monkeypatch, ca
 def test_the_dialog_offers_fixed_speed(qapp):
     dialog = RunSetupDialog(RunSetup(placement=HERE))
     dialog.by_servo.setChecked(True)
-    assert dialog.physical_box.isEnabled() and not dialog.blend.isEnabled()
+    assert not dialog.tcp_speed.isHidden() and not dialog.acc.isHidden() and dialog.blend.isHidden()
+    assert dialog.speed_label.text() == "G0 (rapid) moves"
     dialog.tcp_speed.setValue(25.0)
     dialog.accept()
     a = dialog.chosen.apply(default_settings())

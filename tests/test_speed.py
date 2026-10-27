@@ -179,7 +179,7 @@ def test_a_tall_window_puts_the_view_above_the_panels(qapp):
     win.close()
 
 
-def test_the_speed_panel_sits_under_the_3d_view_and_lays_out_by_width(qapp):
+def test_the_speed_panel_sits_under_the_3d_view_and_has_nothing_to_set(qapp):
     win = gcode_gui.MainWindow(default_settings())
     win.show()
     win.showNormal()
@@ -189,12 +189,10 @@ def test_the_speed_panel_sits_under_the_3d_view_and_lays_out_by_width(qapp):
     assert win.tabs.indexOf(win.speed) == -1
     canvas_h, speed_h = win.left_split.sizes()
     assert canvas_h > speed_h > 0.25 * (canvas_h + speed_h)       # about 3 : 2
-    win.speed.resize(900, 300)
-    win.speed._arrange()
-    assert win.speed._body.direction() == gcode_gui.QtWidgets.QBoxLayout.Direction.LeftToRight
-    win.speed.resize(400, 300)
-    win.speed._arrange()
-    assert win.speed._body.direction() == gcode_gui.QtWidgets.QBoxLayout.Direction.TopToBottom
+    # automatic reference, a fixed +/- 15 % band: no spin boxes, only Clear
+    assert win.speed.findChildren(gcode_gui.QtWidgets.QAbstractSpinBox) == []
+    assert [b.text() for b in win.speed.findChildren(gcode_gui.QtWidgets.QPushButton)] == ["Clear"]
+    assert win.speed.band == 15.0 and win.speed.stats().tolerance == 15.0
     win.close()
 
 

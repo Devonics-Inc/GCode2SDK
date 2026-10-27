@@ -59,6 +59,8 @@ def program_lines(cmds, a):
         n_targets += 1
 
     if lift > 0:
+        if any(c.kind == "do" for c in cmds):
+            out.append("job.rest_outputs()          # outputs at their state outside the lines")
         out.append(f"# approach: {lift:g} mm above the first point")
         hop(first.poses[-1], first.line, "(approach)")
 
@@ -88,12 +90,14 @@ def program_lines(cmds, a):
             out.append(f"job.set_do({c.code != 5}, {where})")
         elif c.kind == "m" and c.code in (0, 1):
             out.append(f"job.pause({where})")
+        elif c.kind == "do":
+            out.append(f"job.set_outputs({[(int(p), bool(on)) for p, on in c.outputs]!r}, {where})")
         else:
             continue
         n_steps += 1
         n_targets += len(c.poses or ())
 
-    out.append("job.end()                   # wait for the arm, switch the M3 output off")
+    out.append("job.end()                   # wait for the arm, M3 output off, per-line outputs at rest")
     if lift > 0 and last_pose is not None:
         out.append(f"# retract: {lift:g} mm above the last point")
         hop(last_pose, motions[-1].line, "(retract)")
@@ -104,6 +108,7 @@ def build_script(cmds, a, source: str, summary=(), ip: str = "192.168.58.25", ch
                  note: str = "", script_name: str = "") -> str:
     """The text of the stand-alone script for these planned commands and settings."""
     body, n_steps, n_targets = program_lines(cmds, a)
+    rest = eng.rest_states(a) if any(c.kind == "do" for c in cmds) else []
     name = os.path.basename(source)
     script = script_name or os.path.basename(default_name(source))
     stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -122,7 +127,10 @@ def build_script(cmds, a, source: str, summary=(), ip: str = "192.168.58.25", ch
             (f"BLEND = {num(a.blend)}", "mm, blend radius between moves that run on into each other"),
             ("EXACT = -1.0", "the move ends exactly on its point"),
             (f"QUEUE_MAX = {int(a.queue_max)}", "moves queued on the controller at most"),
-            (f"SPINDLE_DO = {int(a.spindle_do)}", "control-box DO switched by M3 / M5 (-1 = none)"),
+            (f"SPINDLE_DO = {int(a.spindle_do)}",
+             "control-box output for M3 / M5: 0-7 = DO0-DO7, 8-15 = CO0-CO7 (-1 = none)"),
+            (f"OUTPUT_REST = {[(p, on) for p, on in rest]!r}",
+             "per-line outputs (DO / CO number, high?) outside the G-code lines"),
             (f"START_WAIT = {num(a.start_wait)}", 's to wait for "motion done" to drop after a move is sent'),
             (f"STEPS, TARGETS = {n_steps}, {n_targets}", "")]
     width = max(len(code) for code, _ in rows) + 2
@@ -200,6 +208,7 @@ class Job:
         self.last_j = None              # joint position of the previous target: the IK reference
         self.last_pose = None           # where the previous move leaves the TCP
         self.spindle_on = False
+        self.outputs_live = False       # per-line outputs were switched: the end / a stop puts them back
         self.count = 0
         self.problems = []              # dry run: the targets without a joint position
 
@@ -349,6 +358,25 @@ class Job:
         self.check(self.robot.SetDO(SPINDLE_DO, int(on)), "SetDO", line)
         self.spindle_on = bool(on)
 
+    def set_outputs(self, outputs, line, src):
+        """Per-line outputs: [(DO, high), ...], switched with the arm at rest at the start of the line."""
+        if self.dry:
+            return
+        self.wait_idle()
+        self.say(line, src, ", ".join(f"SetDO({pin}, {int(on)}) {'DO' if pin < 8 else 'CO'}{pin % 8} "
+                                      f"{'high' if on else 'low'}" for pin, on in outputs))
+        for pin, on in outputs:
+            self.check(self.robot.SetDO(pin, int(on)), "SetDO", line)
+        self.outputs_live = True
+
+    def rest_outputs(self, call=None):
+        """Per-line outputs to their state outside the G-code lines (OUTPUT_REST)."""
+        if self.dry:
+            return
+        for pin, on in OUTPUT_REST:
+            (call or (lambda f: f()))(lambda pin=pin, on=on: self.robot.SetDO(pin, int(on)))
+        self.outputs_live = True
+
     def pause(self, line, src):
         """M0 / M1: wait for the operator."""
         if self.dry:
@@ -364,6 +392,8 @@ class Job:
         if self.spindle_on:
             self.robot.SetDO(SPINDLE_DO, 0)
             self.spindle_on = False
+        if self.outputs_live:
+            self.rest_outputs()
 
     # ---- start / stop
     def prepare(self):
@@ -375,7 +405,7 @@ class Job:
         self.last_j = self.current_joints()
 
     def stop(self):
-        """Stop the arm, then switch the tool output off."""
+        """Stop the arm, then switch the tool output off and the per-line outputs to OUTPUT_REST."""
         def twice(call):                # after Ctrl-C the first call on the connection can fail
             try:
                 return call()
@@ -387,6 +417,8 @@ class Job:
             if self.spindle_on and SPINDLE_DO >= 0:
                 twice(lambda: self.robot.SetDO(SPINDLE_DO, 0))
                 self.spindle_on = False
+            if self.outputs_live:
+                self.rest_outputs(twice)
 
 
 def main(argv=None):
@@ -466,6 +498,12 @@ def build_simple_script(cmds, a, source: str, summary=(), ip: str = "192.168.58.
     first, lift = motions[0], float(a.approach or 0.0)
     do = int(a.spindle_do)
     body, moved, spindle_on = [], [False], False
+    rest = eng.rest_states(a) if any(c.kind == "do" for c in cmds) else []   # outputs outside the lines
+
+    def rest_outputs(why):
+        body.append(f"# per-line outputs at their state outside the lines: {why}")
+        body.extend(f"robot.SetDO({p}, {int(on)})   # {eng.output_name(p)} {'high' if on else 'low'}"
+                    for p, on in rest)
     # physical mode: MoveL / MoveC / Circle at TCP_SPEED mm/s and ACC mm/s^2 instead of the global %
     phys = eng.physical(a)
     units = ", ovl=TCP_SPEED, oacc=ACC, velAccParamMode=1" if phys else ""
@@ -486,6 +524,8 @@ def build_simple_script(cmds, a, source: str, summary=(), ip: str = "192.168.58.
 
     rapid = eng.Cmd("line", first.line, rapid=True, spindle=first.spindle)
     if lift > 0:
+        if rest:
+            rest_outputs("the approach")
         up = first.poses[-1][:2] + [round(first.poses[-1][2] + lift, 4)] + first.poses[-1][3:]
         if a.g0 == "movej":
             movej(up, rapid, f"approach: {lift:g} mm above the first point")
@@ -512,22 +552,28 @@ def build_simple_script(cmds, a, source: str, summary=(), ip: str = "192.168.58.
             if c.kind == "arc":
                 last_pose = c.poses[1]
         elif c.kind == "dwell":
-            body.append(f"# {where(c)}")
+            body.append(f"# {where(c)}" + (" - per-line delay" if c.added else ""))
             body.append(f"time.sleep({short(c.seconds)})")
         elif c.kind == "m" and c.code in (3, 4, 5):
             on = int(c.code != 5)
             body.append(f"# {where(c)}")
             if do >= 0:
-                body.append(f"robot.SetDO({do}, {on})")
+                body.append(f"robot.SetDO({do}, {on})   # {eng.output_name(do)}")
                 spindle_on = bool(on)
             else:
                 body.append(f"# (no output chosen for M3 / M5 - this would be robot.SetDO(<DO>, {on}))")
         elif c.kind == "m" and c.code in (0, 1):
             body.append(f"# {where(c)}")
             body.append(f"input('N{c.line}: paused - press Enter to continue ')")
+        elif c.kind == "do":
+            body.append(f"# {where(c)} - per-line outputs")
+            for pin, on in c.outputs:
+                body.append(f"robot.SetDO({int(pin)}, {int(on)})   # {eng.output_name(pin)} {'high' if on else 'low'}")
     if spindle_on:
         body.append("# switch the output off at the end")
-        body.append(f"robot.SetDO({do}, 0)")
+        body.append(f"robot.SetDO({do}, 0)   # {eng.output_name(do)}")
+    if rest:
+        rest_outputs("the end of the job")
     if lift > 0 and last_pose is not None:
         up = last_pose[:2] + [round(last_pose[2] + lift, 4)] + last_pose[3:]
         if a.g0 == "movej":
@@ -581,7 +627,7 @@ try:
     print("Done.")
 except KeyboardInterrupt:
     robot.StopMotion()
-    print("Stopped.")
+''' + "".join(f"    robot.SetDO({p}, {int(on)})\n" for p, on in rest) + '''    print("Stopped.")
 finally:
     robot.CloseRPC()
 '''

@@ -10,7 +10,7 @@ from fairino_gcode import gcode_gui
 from fairino_gcode import gcode_to_fairino as eng
 from fairino_gcode import sim_robot
 from fairino_gcode.plan_model import build_plan, default_settings
-from fairino_gcode.run_control import HERE, MANUAL, REF, Job, RobotSession, RunSetup, RunSetupDialog
+from fairino_gcode.run_control import AUTO, HERE, MANUAL, REF, Job, RobotSession, RunSetup, RunSetupDialog
 
 SMALL = """G21 G90
 S6000 M3
@@ -233,19 +233,22 @@ def test_setup_dialog_round_trip_and_validation(qapp):
     dialog = RunSetupDialog(RunSetup())
     dialog.accept()                                         # reference point chosen but no name typed
     assert dialog.chosen is None and "name of the reference teach point" in dialog.message.text()
-    dialog.by_manual.setChecked(True)
-    dialog.origin[0].setValue(250.5)
+    assert not hasattr(dialog, "by_manual")                  # three ways to place the drawing, no typed origin
+    dialog.by_here.setChecked(True)
     dialog.global_speed.setValue(40)
     dialog.accept()
-    assert dialog.chosen.placement == MANUAL and dialog.chosen.origin[0] == 250.5
+    assert dialog.chosen.placement == HERE
     assert dialog.chosen.global_speed == 40 and dialog.chosen.speed_mode == "percent"
     a = dialog.chosen.apply(default_settings())
-    assert a.origin == [250.5, 0.0, 200.0] and not a.origin_here and a.ref_point is None
-    # constant TCP speed: the mm/s fields are only editable in that mode, and reach the engine
+    assert a.origin_here and a.ref_point is None
+    # % mode shows the % (for every move) and the blend; mm/s mode adds TCP speed and acceleration, and the %
+    # is then only the G0 speed
     again = RunSetupDialog(dialog.chosen)
-    assert not again.physical_box.isEnabled()
+    assert again.tcp_speed.isHidden() and again.acc.isHidden() and not again.blend.isHidden()
+    assert again.speed_label.text() == "Speed"
     again.by_physical.setChecked(True)
-    assert again.physical_box.isEnabled()
+    assert not again.tcp_speed.isHidden() and not again.acc.isHidden() and not again.blend.isHidden()
+    assert again.speed_label.text() == "G0 (rapid) moves"
     again.tcp_speed.setValue(35.0)
     again.acc.setValue(500.0)
     again.blend.setValue(2.0)
@@ -253,6 +256,16 @@ def test_setup_dialog_round_trip_and_validation(qapp):
     a = again.chosen.apply(default_settings())
     assert (a.speed_mode, a.tcp_speed, a.acc, a.blend, a.global_speed) == ("physical", 35.0, 500.0, 2.0, 40)
     assert "TCP speed 35 mm/s" in again.chosen.describe() and RunSetupDialog(again.chosen).by_physical.isChecked()
+
+
+def test_dialog_shows_a_place_fixed_by_a_check_as_the_option_that_found_it(qapp):
+    pinned = RunSetup(placement=MANUAL, placed_by=AUTO, origin=[310.0, 5.0, 120.0], tool=2, user=1)
+    dialog = RunSetupDialog(pinned)
+    assert dialog.by_auto.isChecked()
+    dialog.accept()                                          # checking again searches again...
+    assert dialog.chosen.placement == AUTO and dialog.chosen.placed_by == ""
+    assert (dialog.chosen.tool, dialog.chosen.user) == (2, 1)    # ...and what the dialog does not show is kept
+    assert RunSetupDialog(RunSetup(placement=MANUAL)).by_ref.isChecked()
 
 
 # ------------------------------------------------------------------ window
@@ -299,6 +312,7 @@ def test_check_redraws_the_plan_where_the_robot_will_run_it(qapp):
     assert win.plan is win.checked and sim.moves() == []
     # "at the current TCP" is remembered as coordinates, so the origin does not wander afterwards
     assert win.setup.placement == MANUAL and win.setup.origin == [300.0, -200.0, 400.0]
+    assert win.setup.placed_by == HERE and RunSetupDialog(win.setup).by_here.isChecked()
     assert wait_until(lambda: win.canvas._tcp is not None, 5)
     assert (abs(win.canvas._tcp - win.canvas._centre) <= win.canvas._half).all()     # robot and plan in view
     win.close()
@@ -537,16 +551,15 @@ def test_turning_the_drawing_lays_it_along_the_other_axis(qapp):
 
 def test_dialog_posture_and_rotation_fields(qapp):
     dialog = RunSetupDialog(RunSetup())
-    assert dialog.keep_posture.isChecked() and not dialog.tool_down.isChecked()
+    assert dialog.keep_posture.isChecked() and not hasattr(dialog, "tool_down")   # the WebApp's two choices
     dialog.by_here.setChecked(True)
     dialog.turn_posture.setChecked(True)
-    dialog.tool_down.setChecked(True)
     dialog.yaw.setValue(90)
     dialog.accept()
     chosen = dialog.chosen
-    assert chosen.turn_with_path and chosen.tool_down and chosen.yaw == 90.0
+    assert chosen.turn_with_path and not chosen.tool_down and chosen.yaw == 90.0
     a = chosen.apply(default_settings())
-    assert a.posture == "tangent" and a.tool_down and a.yaw == 90.0
+    assert a.posture == "tangent" and not a.tool_down and a.yaw == 90.0
     assert RunSetup().apply(default_settings()).posture == "fixed"
     dialog.by_auto.setChecked(True)                               # automatic + may turn: the angle is its to choose
     assert not dialog.yaw.isEnabled()
