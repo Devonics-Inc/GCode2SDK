@@ -3,6 +3,7 @@
 Build the standalone application (no Python needed on the target computer) with PyInstaller.
 
     python packaging/build_app.py --sdk /path/to/fairino-python-sdk/linux      # or .../windows
+    python packaging/build_app.py --sdk ... --version 0.2.0                   # release 0.2.0
 
 --sdk is the folder that CONTAINS the SDK's "fairino" package. It is copied into the application so
 that it can command a real robot. Without it (--no-sdk) the result can only simulate.
@@ -11,10 +12,15 @@ The result is the folder dist/fairino-gcode/ (start it with the fairino-gcode pr
 archive of it next to it. The build ends by starting the application once with --self-test, which runs
 the demo part on the simulated robot: a build that passes is complete.
 
+--version sets the release number first: it is written into src/fairino_gcode/__init__.py (commit that
+change), so the application, its self-test, the archive name and the Windows installer all carry it.
+Without --version the number already in that file is used.
+
 PyInstaller does not cross-compile: build on Linux for Linux and on Windows for Windows.
 """
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -22,6 +28,22 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NAME = "fairino-gcode"
 PACKAGE = os.path.join(ROOT, "src", "fairino_gcode")
+VERSION_FILE = os.path.join(PACKAGE, "__init__.py")
+VERSION_RE = re.compile(r'^__version__ = "([^"]*)"', re.MULTILINE)
+
+
+def set_version(version: str) -> str:
+    """Write `version` into src/fairino_gcode/__init__.py. Returns the number that was there before."""
+    if not re.fullmatch(r"\d+\.\d+\.\d+(?:[.-]?(?:a|b|rc|dev|post)\d*)?", version):
+        sys.exit(f"--version {version!r}: use a number like 0.2.0 (or 0.2.0rc1).")
+    with open(VERSION_FILE, encoding="utf-8") as f:
+        text = f.read()
+    found = VERSION_RE.search(text)
+    if found is None:
+        sys.exit(f"No __version__ line in {VERSION_FILE}.")
+    with open(VERSION_FILE, "w", encoding="utf-8", newline="\n") as f:
+        f.write(VERSION_RE.sub(f'__version__ = "{version}"', text, count=1))
+    return found.group(1)
 
 
 def main() -> int:
@@ -30,10 +52,17 @@ def main() -> int:
     where.add_argument("--sdk", help='folder that contains the FAIRINO SDK\'s "fairino" package')
     where.add_argument("--no-sdk", action="store_true", help="build a simulation-only application")
     ap.add_argument("--skip-test", action="store_true", help="do not run the built application's self-test")
+    ap.add_argument("--version", help="release number to build, e.g. 0.2.0 "
+                                      "(written into src/fairino_gcode/__init__.py)")
     args = ap.parse_args()
 
+    if args.version:
+        before = set_version(args.version)
+        if before != args.version:
+            print(f"version {before} -> {args.version} in {os.path.relpath(VERSION_FILE, ROOT)} (commit this change)")
     sys.path.insert(0, os.path.join(ROOT, "src"))
     from fairino_gcode import __version__
+    print(f"building {NAME} {__version__}")
 
     cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--windowed", "--name", NAME,
            "--distpath", os.path.join(ROOT, "dist"), "--workpath", os.path.join(ROOT, "build"),
@@ -80,6 +109,8 @@ def main() -> int:
     archive = shutil.make_archive(os.path.join(ROOT, "dist", f"{NAME}-{__version__}-{system}"),
                                   "zip" if os.name == "nt" else "gztar", os.path.join(ROOT, "dist"), NAME)
     print(f"\nbuilt  {app_dir}\npacked {archive}")
+    if os.name == "nt":
+        print(f"installer: iscc /DAppVersion={__version__} packaging\\windows\\installer.iss")
     return 0
 
 
